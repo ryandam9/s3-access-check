@@ -50,6 +50,12 @@ func run() int {
 		region       = flag.String("region", "", "override the S3 region instead of auto-detecting it")
 		timeout      = flag.Duration("timeout", 15*time.Second, "overall timeout for network requests")
 		failIfPublic = flag.Bool("fail-if-public", true, "exit 1 when the target is public (set to false to always exit 0 on success)")
+
+		scan        = flag.Bool("scan", false, "scan every object in a bucket and report which are anonymously accessible (even when the bucket is not publicly listable)")
+		prefix      = flag.String("prefix", "", "with --scan, only enumerate keys under this prefix")
+		maxObjects  = flag.Int("max-objects", 1000, "with --scan, stop after enumerating this many objects (0 = no limit)")
+		concurrency = flag.Int("concurrency", 16, "with --scan, number of concurrent anonymous probes")
+		keysFrom    = flag.String("keys-from", "", "with --scan, read candidate keys from this file instead of the S3 API (no AWS credentials required)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -70,6 +76,20 @@ func run() int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+
+	if *scan {
+		if target.IsObject() {
+			fmt.Fprintln(os.Stderr, "error: --scan operates on a bucket; drop the object key from the target")
+			return exitError
+		}
+		return runScan(ctx, target, *asJSON, *failIfPublic, ScanOptions{
+			Prefix:      *prefix,
+			MaxObjects:  *maxObjects,
+			Concurrency: *concurrency,
+			KeysFrom:    *keysFrom,
+			Region:      target.Region,
+		})
+	}
 
 	anon, err := CheckAnonymous(ctx, anonymousClient(), target)
 	if err != nil {
@@ -113,6 +133,57 @@ func run() int {
 		return exitPublic
 	}
 	return exitNotPublic
+}
+
+func runScan(ctx context.Context, target Target, asJSON, failIfPublic bool, opts ScanOptions) int {
+	// Resolve region once up front so the per-object probes reuse it.
+	if opts.Region == "" {
+		r, err := ResolveRegion(ctx, anonymousClient(), target.Bucket)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: resolving region: %v\n", err)
+			return exitError
+		}
+		opts.Region = r
+	}
+
+	res, err := ScanBucket(ctx, anonymousClient(), target.Bucket, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return exitError
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(res); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return exitError
+		}
+	} else {
+		printScan(res)
+	}
+
+	if len(res.PublicObjects) > 0 && failIfPublic {
+		return exitPublic
+	}
+	return exitNotPublic
+}
+
+func printScan(r ScanResult) {
+	fmt.Printf("Bucket:    s3://%s\n", r.Bucket)
+	fmt.Printf("Region:    %s\n", r.Region)
+	fmt.Printf("Source:    %s (enumerated %d, probed %d objects)\n", r.Source, r.Enumerated, r.Probed)
+	if r.Truncated {
+		fmt.Println("Note:      enumeration hit the --max-objects limit; more objects were not scanned")
+	}
+	if len(r.PublicObjects) == 0 {
+		fmt.Println("Result:    no anonymously accessible objects found")
+		return
+	}
+	fmt.Printf("Result:    %d PUBLIC object(s) found:\n", len(r.PublicObjects))
+	for _, o := range r.PublicObjects {
+		fmt.Printf("  PUBLIC  s3://%s/%s  (HTTP %d)\n", r.Bucket, o.Key, o.Status)
+	}
 }
 
 func printHuman(r Report, anon AnonResult) {
@@ -183,6 +254,11 @@ Target formats:
   https://s3.region.amazonaws.com/bucket/key
   bucket
   bucket/key
+
+Scan a whole bucket for publicly accessible objects (even when the bucket
+itself is not publicly listable):
+  s3-access-check --scan s3://my-bucket                 # enumerate via S3 API (needs AWS creds)
+  s3-access-check --scan --keys-from keys.txt s3://my-bucket   # probe known keys, no creds
 
 Flags:
 `)

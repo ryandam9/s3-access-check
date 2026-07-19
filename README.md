@@ -47,10 +47,47 @@ separate permissions — a private bucket can hold public objects and vice versa
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-inspect` | `false` | Also read AWS config (Block Public Access, bucket policy status, ACLs) to explain the result. Requires AWS credentials and read permissions; only works on buckets in your account. |
+| `-scan` | `false` | Scan every object in a bucket and report which are anonymously accessible, even when the bucket itself is not publicly listable. See below. |
+| `-prefix` | — | With `-scan`, only enumerate keys under this prefix. |
+| `-max-objects` | `1000` | With `-scan`, stop after enumerating this many objects (`0` = no limit). |
+| `-concurrency` | `16` | With `-scan`, number of concurrent anonymous probes. |
+| `-keys-from` | — | With `-scan`, read candidate keys from a file instead of the S3 API (no AWS credentials required). |
 | `-json` | `false` | Emit the result as JSON. |
 | `-region` | auto | Override the region instead of auto-detecting it. |
 | `-timeout` | `15s` | Overall network timeout. |
-| `-fail-if-public` | `true` | Exit `1` when the target is public. Set `-fail-if-public=false` to always exit `0` on success. |
+| `-fail-if-public` | `true` | Exit `1` when the target (or, in scan mode, any object) is public. Set `-fail-if-public=false` to always exit `0` on success. |
+
+## Scanning a bucket for public objects
+
+A bucket that is **not** publicly *listable* can still contain individually
+public *objects* — the two are separate permissions. `-scan` finds them by
+enumerating the bucket's keys and probing each one anonymously.
+
+Because you cannot enumerate a non-listable bucket anonymously, key discovery
+uses one of two sources:
+
+- **S3 API (default)** — lists objects with your AWS credentials
+  (`s3:ListBucket`). Use this to audit your own buckets.
+
+  ```sh
+  s3-access-check --scan s3://my-bucket
+  s3-access-check --scan --prefix logs/ --max-objects 5000 s3://my-bucket
+  ```
+
+- **Key list (`--keys-from`)** — probes a newline-delimited file of candidate
+  keys, no credentials required. Blank lines and lines starting with `#` are
+  ignored.
+
+  ```sh
+  s3-access-check --scan --keys-from keys.txt s3://my-bucket
+  ```
+
+Each discovered key is fetched anonymously (ranged `GetObject`); only objects
+that return success are reported as public. In scan mode the tool exits `1` if
+**any** object is anonymously accessible.
+
+> By default only the first `--max-objects` (1000) keys are scanned; the output
+> notes when enumeration was truncated. Raise it or set `0` for no limit.
 
 ### Exit codes
 
@@ -91,6 +128,9 @@ s3-access-check --inspect s3://my-bucket
 4. **(Optional) `--inspect`** — uses the AWS SDK to read
    `GetPublicAccessBlock`, `GetBucketPolicyStatus`, and the bucket/object ACL,
    reporting each best-effort (a missing permission is noted, not fatal).
+5. **(Optional) `--scan`** — enumerates the bucket's keys (via the S3 API with
+   your credentials, or from `--keys-from`) and runs the anonymous object probe
+   against each, concurrently, to surface individually public objects.
 
 ## Caveats
 

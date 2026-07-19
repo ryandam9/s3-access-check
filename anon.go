@@ -34,7 +34,13 @@ type s3ErrorBody struct {
 // can read region-hint headers off a 301 response, and that carries no
 // credentials of any kind.
 func anonymousClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// Reuse connections aggressively so a bucket scan's concurrent probes don't
+	// each pay a fresh TLS handshake.
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 100
 	return &http.Client{
+		Transport: tr,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -85,29 +91,37 @@ func CheckAnonymous(ctx context.Context, c *http.Client, t Target) (AnonResult, 
 		}
 		region = r
 	}
-	res := AnonResult{Target: t, Region: region}
-
 	host := regionalHost(region)
-	var reqURL, method string
 	if t.IsObject() {
-		res.Operation = "GetObject"
-		u := &url.URL{Scheme: "https", Host: host, Path: "/" + t.Bucket + "/" + t.Key}
-		reqURL, method = u.String(), http.MethodGet
-	} else {
-		res.Operation = "ListBucket"
-		u := &url.URL{Scheme: "https", Host: host, Path: "/" + t.Bucket}
-		u.RawQuery = "list-type=2&max-keys=1"
-		reqURL, method = u.String(), http.MethodGet
+		return ProbeObject(ctx, c, host, region, t)
 	}
+	return ProbeBucket(ctx, c, host, region, t)
+}
 
+// ProbeBucket issues an anonymous ListBucket against a bucket whose region and
+// endpoint host have already been resolved.
+func ProbeBucket(ctx context.Context, c *http.Client, host, region string, t Target) (AnonResult, error) {
+	u := &url.URL{Scheme: "https", Host: host, Path: "/" + t.Bucket}
+	u.RawQuery = "list-type=2&max-keys=1"
+	return doProbe(ctx, c, http.MethodGet, u.String(), "", AnonResult{Target: t, Region: region, Operation: "ListBucket"})
+}
+
+// ProbeObject issues an anonymous ranged GetObject against a single object whose
+// region and endpoint host have already been resolved. Requesting only the
+// first byte confirms a public object without downloading its full contents.
+func ProbeObject(ctx context.Context, c *http.Client, host, region string, t Target) (AnonResult, error) {
+	u := &url.URL{Scheme: "https", Host: host, Path: "/" + t.Bucket + "/" + t.Key}
+	return doProbe(ctx, c, http.MethodGet, u.String(), "bytes=0-0", AnonResult{Target: t, Region: region, Operation: "GetObject"})
+}
+
+// doProbe performs the HTTP request and classifies the response into res.
+func doProbe(ctx context.Context, c *http.Client, method, reqURL, rangeHdr string, res AnonResult) (AnonResult, error) {
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
 	if err != nil {
 		return AnonResult{}, err
 	}
-	if t.IsObject() {
-		// Read at most one byte so a public object is confirmed without
-		// downloading its full contents.
-		req.Header.Set("Range", "bytes=0-0")
+	if rangeHdr != "" {
+		req.Header.Set("Range", rangeHdr)
 	}
 
 	resp, err := c.Do(req)
