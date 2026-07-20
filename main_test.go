@@ -57,14 +57,14 @@ func TestScanExitCode(t *testing.T) {
 		allowPartial bool
 		want         int
 	}{
-		{"complete clean", ScanResult{Complete: true}, true, false, exitNotPublic},
-		{"public wins", ScanResult{Complete: true, PublicCount: 1}, true, false, exitPublic},
-		{"incomplete no public fails closed", ScanResult{Complete: false}, true, false, exitError},
-		{"incomplete allow-partial", ScanResult{Complete: false}, true, true, exitNotPublic},
+		{"whole-bucket clean", ScanResult{WholeBucketComplete: true}, true, false, exitNotPublic},
+		{"public wins", ScanResult{WholeBucketComplete: true, PublicCount: 1}, true, false, exitPublic},
+		{"not whole-bucket, no public, fails closed", ScanResult{WholeBucketComplete: false}, true, false, exitError},
+		{"not whole-bucket, allow-partial", ScanResult{WholeBucketComplete: false}, true, true, exitNotPublic},
 		// R2-H-01: fail-if-public=false must not hide incompleteness.
-		{"incomplete + public + failIfPublic=false", ScanResult{Complete: false, PublicCount: 1, InconclusiveCount: 1}, false, false, exitError},
+		{"incomplete + public + failIfPublic=false", ScanResult{WholeBucketComplete: false, PublicCount: 1, InconclusiveCount: 1}, false, false, exitError},
 		// A confirmed public finding still wins when failing on public.
-		{"incomplete + public + failIfPublic=true", ScanResult{Complete: false, PublicCount: 1}, true, false, exitPublic},
+		{"incomplete + public + failIfPublic=true", ScanResult{WholeBucketComplete: false, PublicCount: 1}, true, false, exitPublic},
 	}
 	for _, tc := range cases {
 		if got := scanExitCode(tc.res, tc.failIfPublic, tc.allowPartial); got != tc.want {
@@ -83,6 +83,12 @@ func TestSafeDisplay(t *testing.T) {
 	}
 	if got := safeDisplay("esc\x1b[2J"); strings.Contains(got, "\x1b") {
 		t.Errorf("ANSI escape not neutralized: %q", got)
+	}
+	// Unicode presentation controls must be neutralized too.
+	for _, bad := range []string{"a‮b", "a⁦b", "a​b"} {
+		if got := safeDisplay(bad); got == bad {
+			t.Errorf("unicode format control not escaped in %q", bad)
+		}
 	}
 }
 

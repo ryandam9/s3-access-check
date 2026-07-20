@@ -20,15 +20,17 @@ import (
 	"sort"
 	"strconv"
 	"time"
+	"unicode"
 )
 
 // version is overridable at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
 // schemaVersion identifies the JSON output contract so automation can detect
-// breaking changes. v2 added tri-state fields, scan scope/versions, and the
-// caller-account BPA rename.
-const schemaVersion = 2
+// breaking changes. v3 split scan completeness into completeWithinScope vs
+// wholeBucketComplete, added versioning/scope/target-ref fields, and list-prefix
+// reporting.
+const schemaVersion = 3
 
 // Exit codes let the tool drive scripts and CI:
 //
@@ -42,10 +44,15 @@ const (
 )
 
 // Report is the combined machine-readable output for a single-target check.
+// TargetRef holds the authoritative structured identity (bucket/key/versionId);
+// Target is a convenience display string that is not guaranteed round-trippable
+// for keys containing reserved characters.
 type Report struct {
 	SchemaVersion int            `json:"schemaVersion"`
 	ToolVersion   string         `json:"toolVersion"`
 	Target        string         `json:"target"`
+	TargetRef     Target         `json:"targetRef"`
+	ListPrefix    string         `json:"listPrefix,omitempty"`
 	State         AccessState    `json:"state"`
 	Public        bool           `json:"public"`
 	Operation     string         `json:"operation"`
@@ -85,11 +92,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 		scan            = fs.Bool("scan", false, "scan every object in a bucket and report which are anonymously accessible (even when the bucket is not publicly listable)")
 		prefix          = fs.String("prefix", "", "with --scan, only enumerate keys under this prefix")
-		maxObjects      = fs.Int("max-objects", 1000, "with --scan, stop after enumerating this many objects (0 = no limit)")
+		maxObjects      = fs.Int("max-objects", 1000, "with --scan, stop after enumerating this many targets — keys, or versions with --include-versions (0 = no limit)")
+		maxFindings     = fs.Int("max-findings", 1000, "with --scan, cap retained public/inconclusive examples in output (0 = no cap); counts stay exact")
 		concurrency     = fs.Int("concurrency", 16, "with --scan, number of concurrent anonymous probes (1-256)")
 		keysFrom        = fs.String("keys-from", "", "with --scan, read candidate keys from this file instead of the S3 API (no AWS credentials required)")
-		includeVersions = fs.Bool("include-versions", false, "with --scan (S3 API source), enumerate all object versions via ListObjectVersions, not just current versions")
-		allowPartial    = fs.Bool("allow-partial", false, "with --scan, exit 0 for a truncated/incomplete scan that found no public object (default: incomplete scans exit 2)")
+		includeVersions = fs.Bool("include-versions", false, "with --scan (S3 API source), enumerate all data-bearing object versions via ListObjectVersions, not just current versions")
+		allowPartial    = fs.Bool("allow-partial", false, "with --scan, exit 0 for a scan that found no public object but did not fully cover the whole bucket (default: such scans exit 2)")
 	)
 	fs.Usage = func() { usage(stderr, fs) }
 
@@ -118,7 +126,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: invalid --region %q\n", *region)
 		return exitError
 	}
-	if err := validateScanFlags(*scan, *inspect, *maxObjects, *concurrency, *keysFrom, *includeVersions, set); err != nil {
+	if err := validateScanFlags(*scan, *inspect, *maxObjects, *maxFindings, *concurrency, *keysFrom, *includeVersions, set); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitError
 	}
@@ -130,6 +138,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *region != "" {
 		target.Region = *region
+	}
+
+	// --list-prefix only applies to a single bucket check.
+	if *listPrefix != "" {
+		if *scan {
+			fmt.Fprintln(stderr, "error: --list-prefix is for a single bucket check; use --prefix with --scan")
+			return exitError
+		}
+		if target.IsObject() {
+			fmt.Fprintln(stderr, "error: --list-prefix applies to a bucket target, not an object")
+			return exitError
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -144,6 +164,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runScan(ctx, stdout, stderr, client, target, *asJSON, *failIfPublic, *allowPartial, ScanOptions{
 			Prefix:          *prefix,
 			MaxObjects:      *maxObjects,
+			MaxFindings:     *maxFindings,
 			Concurrency:     *concurrency,
 			KeysFrom:        *keysFrom,
 			IncludeVersions: *includeVersions,
@@ -160,13 +181,16 @@ var regionTokenRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)+$`)
 
 func validRegion(r string) bool { return regionTokenRe.MatchString(r) }
 
-func validateScanFlags(scan, inspect bool, maxObjects, concurrency int, keysFrom string, includeVersions bool, set map[string]bool) error {
+func validateScanFlags(scan, inspect bool, maxObjects, maxFindings, concurrency int, keysFrom string, includeVersions bool, set map[string]bool) error {
 	if scan {
 		if inspect {
 			return fmt.Errorf("--inspect is not supported with --scan")
 		}
 		if maxObjects < 0 {
 			return fmt.Errorf("--max-objects must be >= 0")
+		}
+		if maxFindings < 0 {
+			return fmt.Errorf("--max-findings must be >= 0")
 		}
 		if concurrency < 1 || concurrency > 256 {
 			return fmt.Errorf("--concurrency must be between 1 and 256")
@@ -178,7 +202,7 @@ func validateScanFlags(scan, inspect bool, maxObjects, concurrency int, keysFrom
 	}
 	// Reject scan-only flags outside scan mode so a user is never misled into
 	// thinking a limit or filter was applied.
-	for _, name := range []string{"prefix", "max-objects", "concurrency", "keys-from", "include-versions", "allow-partial"} {
+	for _, name := range []string{"prefix", "max-objects", "max-findings", "concurrency", "keys-from", "include-versions", "allow-partial"} {
 		if set[name] {
 			return fmt.Errorf("--%s requires --scan", name)
 		}
@@ -197,6 +221,8 @@ func runCheck(ctx context.Context, stdout, stderr io.Writer, client *http.Client
 		SchemaVersion: schemaVersion,
 		ToolVersion:   version,
 		Target:        target.String(),
+		TargetRef:     target,
+		ListPrefix:    listPrefix,
 		State:         anon.State,
 		Public:        anon.Public(),
 		Operation:     anon.Operation,
@@ -273,14 +299,17 @@ func runScan(ctx context.Context, stdout, stderr io.Writer, client *http.Client,
 }
 
 // scanExitCode maps a scan result to an exit code. A confirmed public object is
-// actionable regardless of completeness, so it takes precedence. Crucially,
-// --fail-if-public=false must NOT suppress an incomplete-scan error:
-// completeness is checked independently.
+// actionable regardless of coverage, so it takes precedence. Otherwise the scan
+// fails closed: exit 0 (definitively no public access) requires a WHOLE-BUCKET
+// audit — every current object and, for a versioned bucket, every version. A
+// clean but partial scope (a prefix, a key file, or current-versions-only on a
+// versioned/unknown bucket) exits 2 unless --allow-partial. --fail-if-public
+// controls only the public→exit-1 mapping and cannot mask incompleteness.
 func scanExitCode(res ScanResult, failIfPublic, allowPartial bool) int {
 	if res.PublicCount > 0 && failIfPublic {
 		return exitPublic
 	}
-	if !res.Complete && !allowPartial {
+	if !res.WholeBucketComplete && !allowPartial {
 		return exitError
 	}
 	return exitNotPublic
@@ -313,9 +342,15 @@ func printHuman(w io.Writer, r Report, anon AnonResult) {
 		fmt.Fprintln(w, "Note:      the resource does not appear to exist")
 	}
 
+	if !anon.Target.IsObject() && r.ListPrefix != "" {
+		fmt.Fprintf(w, "Prefix:    %s\n", safeDisplay(r.ListPrefix))
+	}
+
 	if r.Public {
 		if anon.Target.IsObject() {
 			fmt.Fprintln(w, "Meaning:   this unsigned request retrieved the object — it is anonymously downloadable")
+		} else if r.ListPrefix != "" {
+			fmt.Fprintf(w, "Meaning:   this unsigned request listed objects under prefix %s — that prefix is anonymously listable\n", safeDisplay(r.ListPrefix))
 		} else {
 			fmt.Fprintln(w, "Meaning:   this unsigned request listed the bucket — it is anonymously listable")
 			fmt.Fprintln(w, "           (individual objects may have different, separate permissions)")
@@ -329,11 +364,14 @@ func printHuman(w io.Writer, r Report, anon AnonResult) {
 	}
 }
 
-// safeDisplay escapes control characters so untrusted object keys cannot inject
-// newlines or ANSI escape sequences into terminal or CI-log output.
+// safeDisplay escapes untrusted text (object keys, version IDs, prefixes) for
+// terminal/CI-log output. It quotes when the string contains ASCII control
+// characters OR Unicode format/bidi controls (category Cf, e.g. U+202E
+// RIGHT-TO-LEFT OVERRIDE, U+2066 isolates, U+200B zero-width space) that could
+// visually reorder or hide output without an ASCII newline or ESC byte.
 func safeDisplay(s string) string {
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if r < 0x20 || r == 0x7f || unicode.Is(unicode.Cf, r) || !unicode.IsPrint(r) {
 			return strconv.QuoteToASCII(s)
 		}
 	}
@@ -396,14 +434,31 @@ func printScan(w io.Writer, r ScanResult) {
 	fmt.Fprintf(w, "Bucket:    s3://%s\n", r.Bucket)
 	fmt.Fprintf(w, "Region:    %s\n", r.Region)
 	fmt.Fprintf(w, "Source:    %s\n", r.Source)
-	fmt.Fprintf(w, "Scope:     %s\n", r.Scope)
+	if r.Prefix != "" {
+		fmt.Fprintf(w, "Prefix:    %s\n", safeDisplay(r.Prefix))
+	}
+	fmt.Fprintf(w, "Scope:     %s (unit: %s)\n", r.Scope, r.EnumeratedUnit)
+	if r.Source == "s3-api" {
+		if r.VersioningKnown {
+			status := r.VersioningStatus
+			if status == "" {
+				status = "not versioned"
+			}
+			fmt.Fprintf(w, "Versioning: %s\n", status)
+		} else {
+			fmt.Fprintln(w, "Versioning: UNKNOWN (lookup failed)")
+		}
+	}
 	fmt.Fprintf(w, "Coverage:  enumerated %d, completed %d (public %d, not-public %d, inconclusive %d)\n",
 		r.Enumerated, r.Completed, r.PublicCount, r.NotPublicCount, r.InconclusiveCount)
+	if r.DeleteMarkersObserved > 0 {
+		fmt.Fprintf(w, "           %d delete marker(s) observed (not probed — no object body)\n", r.DeleteMarkersObserved)
+	}
 	for _, warn := range r.Warnings {
 		fmt.Fprintf(w, "Warning:   %s\n", warn)
 	}
 
-	if !r.Complete {
+	if !r.CompleteWithinScope {
 		reasons := []string{}
 		if r.Truncated {
 			reasons = append(reasons, "hit --max-objects limit")
@@ -414,15 +469,22 @@ func printScan(w io.Writer, r ScanResult) {
 		if r.InconclusiveCount > 0 {
 			reasons = append(reasons, fmt.Sprintf("%d probe(s) inconclusive", r.InconclusiveCount))
 		}
-		fmt.Fprintf(w, "Status:    INCOMPLETE (%s) — a clean result here does NOT certify the bucket\n", joinReasons(reasons))
+		fmt.Fprintf(w, "Status:    INCOMPLETE within scope (%s)\n", joinReasons(reasons))
+	} else if !r.WholeBucketComplete {
+		fmt.Fprintln(w, "Status:    complete WITHIN SCOPE, but this is NOT a whole-bucket audit")
+		fmt.Fprintln(w, "           (a clean result here does NOT certify the entire bucket)")
 	} else {
-		fmt.Fprintln(w, "Status:    complete")
+		fmt.Fprintln(w, "Status:    complete — whole-bucket audit")
 	}
 
-	if len(r.PublicObjects) == 0 {
+	if r.FindingsTruncated {
+		fmt.Fprintln(w, "Note:      retained findings were capped (--max-findings); counts above are exact")
+	}
+
+	if len(r.PublicObjects) == 0 && r.PublicCount == 0 {
 		fmt.Fprintln(w, "Result:    no anonymously accessible objects found in what was checked")
 	} else {
-		fmt.Fprintf(w, "Result:    %d PUBLIC object(s) found:\n", len(r.PublicObjects))
+		fmt.Fprintf(w, "Result:    %d PUBLIC object(s) found (showing %d):\n", r.PublicCount, len(r.PublicObjects))
 		for _, o := range r.PublicObjects {
 			fmt.Fprintf(w, "  PUBLIC  s3://%s/%s%s  (HTTP %d)\n", r.Bucket, safeDisplay(o.Key), versionSuffix(o.VersionID), o.Status)
 		}
@@ -439,7 +501,7 @@ func versionSuffix(v string) string {
 	if v == "" {
 		return ""
 	}
-	return "?versionId=" + v
+	return "?versionId=" + safeDisplay(v)
 }
 
 func joinReasons(reasons []string) string {
