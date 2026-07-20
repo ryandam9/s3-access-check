@@ -29,6 +29,11 @@ Because this is a security tool, it never conflates "proven not public" with
 > **Failure to prove public access is not the same as proving a resource is not
 > public.** An `inconclusive` result (exit `2`) must not be read as "safe".
 
+A `public` result reflects **this request's context**. S3 policies can condition
+access on source IP, headers, referrer, time, or VPC, so another anonymous
+caller may get a different answer. The verdict means "this unsigned request, from
+here, now, succeeded" — it is strong evidence, not a proof about every caller.
+
 ## Install
 
 ```sh
@@ -63,27 +68,34 @@ presigned URLs are rejected — the tool must remain anonymous. A `versionId`
 query parameter is honored for object checks.
 
 If the target has no key, the **bucket** is checked for public *listability*.
-If it has a key, that **object** is checked for public *readability* (via an
-anonymous `HEAD`, which needs the same permission as `GET`, returns no body, and
-correctly handles zero-byte objects). These are separate permissions — a private
-bucket can hold public objects and vice versa.
+If it has a key, that **object** is checked for public *downloadability* via an
+anonymous data-plane `GET` requesting only the first byte (`Range: bytes=0-0`).
+This exercises the real download path — so an object whose bucket policy allows
+anonymous `s3:GetObject` but which cannot actually be retrieved (SSE-KMS decrypt
+required, or an archived/unrestored storage class) is correctly reported *not*
+downloadable, rather than the false "public" a metadata-only `HEAD` would give.
+A zero-byte object (which can't satisfy the range) falls back to a bounded full
+`GET`. Bucket listability and object readability are separate permissions — a
+private bucket can hold public objects and vice versa.
 
 ### Flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-inspect` | `false` | Also read AWS config (Block Public Access at bucket **and** account level, bucket policy status, ACLs) to explain the result. Requires AWS credentials; only works on buckets in your account. |
+| `-inspect` | `false` | Also read AWS config (Block Public Access at bucket **and** caller-account level, bucket policy status, ACLs) to explain the result. Requires AWS credentials; intended for buckets in your account. |
+| `-list-prefix` | — | For a single bucket check, test anonymous `ListBucket` scoped to this prefix (some policies grant listing only under a prefix). |
 | `-scan` | `false` | Scan every object in a bucket and report which are anonymously accessible. See below. |
 | `-prefix` | — | With `-scan`, only enumerate keys under this prefix. |
 | `-max-objects` | `1000` | With `-scan`, stop after enumerating this many objects (`0` = no limit). **This is a coverage limit, not just a performance knob** — see completeness below. |
 | `-concurrency` | `16` | With `-scan`, number of concurrent anonymous probes (1–256). |
 | `-keys-from` | — | With `-scan`, read candidate keys from a file instead of the S3 API (no AWS credentials required). |
+| `-include-versions` | `false` | With `-scan` (S3 API source), enumerate **all** object versions via `ListObjectVersions`, not just current versions. |
 | `-allow-partial` | `false` | With `-scan`, exit `0` for a truncated/incomplete scan that found no public object (default: incomplete scans exit `2`). |
 | `-json` | `false` | Emit the result as JSON (includes `schemaVersion` and `toolVersion`). |
 | `-region` | auto | Override the region instead of auto-detecting it. |
-| `-request-timeout` | `15s` | Timeout for each individual HTTP/AWS request. |
+| `-request-timeout` | `15s` | Timeout for each anonymous HTTP request (AWS SDK calls are bounded by `-timeout`). |
 | `-timeout` | `60s` | Overall timeout for the whole operation. **Raise this for large scans.** |
-| `-fail-if-public` | `true` | Exit `1` when the target (or, in scan mode, any object) is public. |
+| `-fail-if-public` | `true` | Exit `1` when the target (or, in scan mode, any object) is public. Does **not** suppress the incomplete-scan exit `2`. |
 | `-version` | | Print version and exit. |
 
 ### Exit codes
@@ -135,6 +147,16 @@ probe was conclusive. If a scan is incomplete and no public object was found,
 the tool exits `2` (not `0`) so CI never treats a partial scan as a pass. Pass
 `--allow-partial` to opt into exit `0` for incomplete scans.
 
+### Version scope
+
+By default a scan covers **current** object versions only (`scope:
+current_versions`). In a versioning-enabled bucket, a noncurrent version can be
+independently public (different ACL, or hidden behind a delete marker) — so the
+default scan detects versioning and **warns** that noncurrent versions were not
+checked. Pass `--include-versions` to enumerate every version via
+`ListObjectVersions` (`scope: all_versions`); findings then carry a `versionId`.
+A `complete` current-versions scan does **not** certify the whole bucket.
+
 ## Supported resources
 
 - **Supported:** general-purpose AWS S3 buckets via standard commercial
@@ -149,18 +171,24 @@ the tool exits `2` (not `0`) so CI never treats a partial scan as a pass. Pass
 
 The anonymous probe needs **no** AWS permissions. The optional modes do:
 
-Scan enumeration (`--scan` via the S3 API):
+Scan enumeration (`--scan` via the S3 API; add `s3:ListBucketVersions` for
+`--include-versions`, and `s3:GetBucketVersioning` for the versioning warning):
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::example-bucket" }
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning"],
+      "Resource": "arn:aws:s3:::example-bucket"
+    }
   ]
 }
 ```
 
-Config inspection (`--inspect`):
+Config inspection (`--inspect`; add `s3:GetObjectVersionAcl` when checking a
+specific object `versionId`):
 
 ```json
 {
@@ -174,6 +202,7 @@ Config inspection (`--inspect`):
         "s3:GetAccountPublicAccessBlock",
         "s3:GetBucketAcl",
         "s3:GetObjectAcl",
+        "s3:GetObjectVersionAcl",
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"
@@ -182,16 +211,21 @@ Config inspection (`--inspect`):
 }
 ```
 
-Account-level Block Public Access inspection uses S3 Control and reflects the
-caller's account; organization-enforced (SCP) policy is not separately visible
-and is noted as a warning.
+The `--inspect` account-level Block Public Access result is the **authenticated
+caller's** account (via STS + S3 Control), not verified to be the bucket owner's
+account — for a cross-account bucket it may not describe the owning account. The
+result is the effective caller-account configuration and may be enforced by an
+AWS Organizations S3 policy; the API does not identify the source. Both caveats
+are emitted as warnings.
 
 ## How it works
 
 1. **Region resolution** — an unauthenticated `HEAD` to the global endpoint
    reads the `x-amz-bucket-region` response header.
-2. **Bucket check** — anonymous `GET /?list-type=2` (`ListBucket`).
-3. **Object check** — anonymous `HEAD` (`GetObject`).
+2. **Bucket check** — anonymous `GET /?list-type=2` (`ListBucket`), optionally
+   scoped to `--list-prefix`.
+3. **Object check** — anonymous ranged `GET` (`Range: bytes=0-0`), with a bounded
+   full-`GET` fallback on `416` for zero-byte objects.
 4. **Wrong-region handling** — a `301`/`307`/`400` that advertises the correct
    region triggers exactly one retry against it.
 5. **Classification** — only `2xx` → public, `403`/`404` → not public; every

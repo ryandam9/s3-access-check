@@ -36,12 +36,15 @@ func TestParseTarget(t *testing.T) {
 		{in: "https://b-ucket.s3.amazonaws.com/a%25b", bucket: "b-ucket", key: "a%b"},
 		// legacy bucket names (uppercase / underscore) are accepted
 		{in: "s3://Legacy_Bucket.Name", bucket: "Legacy_Bucket.Name"},
+		// trailing space in a key is preserved (no trimming)
+		{in: "s3://my-bucket/key ", bucket: "my-bucket", key: "key "},
 		// errors
 		{in: "", wantErr: true},
 		{in: "s3://", wantErr: true},
 		{in: "ab", wantErr: true},                                                     // too short
 		{in: "https://minio.example/my-bucket/key", wantErr: true},                    // unknown host
 		{in: "https://my-bucket.s3.amazonaws.com/k?X-Amz-Signature=x", wantErr: true}, // signed URL
+		{in: "https://my-bucket.s3.amazonaws.com/k?partNumber=1", wantErr: true},      // unsupported query param
 	}
 
 	for _, tc := range tests {

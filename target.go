@@ -22,10 +22,14 @@ type Target struct {
 func (t Target) IsObject() bool { return t.Key != "" }
 
 func (t Target) String() string {
+	s := "s3://" + t.Bucket
 	if t.IsObject() {
-		return fmt.Sprintf("s3://%s/%s", t.Bucket, t.Key)
+		s += "/" + t.Key
 	}
-	return fmt.Sprintf("s3://%s", t.Bucket)
+	if t.VersionID != "" {
+		s += "?versionId=" + t.VersionID
+	}
+	return s
 }
 
 var (
@@ -44,8 +48,13 @@ var (
 // Only AWS S3 endpoints (*.amazonaws.com) are accepted for URL inputs; an
 // unrecognized host is rejected rather than silently reinterpreted as an AWS
 // bucket name.
+// Note on key fidelity: for s3:// URIs and bare bucket/key inputs the key is
+// used literally (matching AWS CLI convention — s3:// keys are not
+// percent-decoded), whereas https:// URL paths are percent-decoded per URL
+// rules. The input is not whitespace-trimmed, so keys with leading/trailing
+// spaces are preserved exactly.
 func ParseTarget(input string) (Target, error) {
-	raw := strings.TrimSpace(input)
+	raw := input
 	if raw == "" {
 		return Target{}, fmt.Errorf("empty target")
 	}
@@ -111,6 +120,13 @@ func parseHTTPURL(raw string) (Target, error) {
 	for _, p := range authQueryParams {
 		if q.Has(p) {
 			return Target{}, fmt.Errorf("target looks like a signed/presigned URL (%s present); pass an unsigned S3 path instead", p)
+		}
+	}
+	// Only versionId is honored; reject anything else so the displayed target
+	// and the actual probe cannot diverge.
+	for p := range q {
+		if p != "versionId" {
+			return Target{}, fmt.Errorf("unsupported query parameter %q (only versionId is allowed)", p)
 		}
 	}
 	versionID := q.Get("versionId")

@@ -53,8 +53,11 @@ func TestProbeObjectClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := testClient(func(r *http.Request) *http.Response {
-				if r.Method != http.MethodHead {
-					t.Errorf("object probe should use HEAD, got %s", r.Method)
+				if r.Method != http.MethodGet {
+					t.Errorf("object probe should use GET, got %s", r.Method)
+				}
+				if got := r.Header.Get("Range"); got != "bytes=0-0" {
+					t.Errorf("object probe should send Range bytes=0-0, got %q", got)
 				}
 				return resp(tc.status, nil, tc.body)
 			})
@@ -78,7 +81,7 @@ func TestProbeBucketDeniedExists(t *testing.T) {
 	c := testClient(func(r *http.Request) *http.Response {
 		return resp(403, nil, accessDeniedBody)
 	})
-	got, err := ProbeBucket(context.Background(), c, "us-east-1", Target{Bucket: "b-ucket"})
+	got, err := ProbeBucket(context.Background(), c, "us-east-1", Target{Bucket: "b-ucket"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +119,46 @@ func TestProbeWrongRegionRetry(t *testing.T) {
 	}
 	if got.Region != "eu-west-1" {
 		t.Errorf("region = %q, want eu-west-1", got.Region)
+	}
+}
+
+func TestProbeObjectZeroByteFallback(t *testing.T) {
+	// A zero-byte object cannot satisfy Range: bytes=0-0 (416); the probe must
+	// fall back to a rangeless GET and classify the 200 as public.
+	var ranged, full int
+	c := testClient(func(r *http.Request) *http.Response {
+		if r.Header.Get("Range") != "" {
+			ranged++
+			return resp(416, nil, `<?xml version="1.0"?><Error><Code>InvalidRange</Code></Error>`)
+		}
+		full++
+		return resp(200, nil, "")
+	})
+	got, err := ProbeObject(context.Background(), c, "us-east-1", Target{Bucket: "b-ucket", Key: "empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ranged != 1 || full != 1 {
+		t.Errorf("expected 1 ranged + 1 full GET, got %d + %d", ranged, full)
+	}
+	if got.State != AccessPublic {
+		t.Errorf("zero-byte public object should be public, got %q", got.State)
+	}
+}
+
+func TestProbeBucketListPrefix(t *testing.T) {
+	c := testClient(func(r *http.Request) *http.Response {
+		if got := r.URL.Query().Get("prefix"); got != "public/" {
+			t.Errorf("prefix = %q, want public/", got)
+		}
+		return resp(200, nil, "")
+	})
+	got, err := ProbeBucket(context.Background(), c, "us-east-1", Target{Bucket: "b-ucket"}, "public/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != AccessPublic {
+		t.Errorf("state = %q, want public", got.State)
 	}
 }
 

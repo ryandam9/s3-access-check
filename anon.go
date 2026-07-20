@@ -83,35 +83,55 @@ func regionalHost(region string) string {
 }
 
 // CheckAnonymous probes the target without credentials and reports whether it is
-// anonymously accessible. For a bucket it attempts an anonymous list; for an
-// object it attempts an anonymous HEAD (which needs the same s3:GetObject
-// permission as GET, returns no body, and — unlike a ranged GET — is not
-// defeated by zero-byte objects).
-func CheckAnonymous(ctx context.Context, c *http.Client, t Target) (AnonResult, error) {
+// anonymously accessible. For a bucket it attempts an anonymous list (optionally
+// scoped to listPrefix); for an object it attempts an anonymous data read.
+func CheckAnonymous(ctx context.Context, c *http.Client, t Target, listPrefix string) (AnonResult, error) {
 	if t.IsObject() {
 		return ProbeObject(ctx, c, t.Region, t)
 	}
-	return ProbeBucket(ctx, c, t.Region, t)
+	return ProbeBucket(ctx, c, t.Region, t, listPrefix)
 }
 
 // ProbeBucket issues an anonymous ListBucket. region may be empty; the probe
-// starts at the global endpoint and follows a single region redirect.
-func ProbeBucket(ctx context.Context, c *http.Client, region string, t Target) (AnonResult, error) {
-	return probeWithRetry(ctx, c, region, t, http.MethodGet, "/"+t.Bucket, "list-type=2&max-keys=1", "ListBucket", false)
+// starts at the global endpoint and follows a single region redirect. When
+// listPrefix is set, the list is scoped to it — some policies grant anonymous
+// s3:ListBucket only under a specific prefix.
+func ProbeBucket(ctx context.Context, c *http.Client, region string, t Target, listPrefix string) (AnonResult, error) {
+	q := "list-type=2&max-keys=1"
+	if listPrefix != "" {
+		q += "&prefix=" + url.QueryEscape(listPrefix)
+	}
+	return probeWithRetry(ctx, c, region, t, "/"+t.Bucket, q, "", "ListBucket", false)
 }
 
-// ProbeObject issues an anonymous HEAD against a single object.
+// ProbeObject issues an anonymous data-plane GET. It requests only the first
+// byte (Range: bytes=0-0) so a public object is confirmed without downloading
+// it in full, while still exercising the same code path as a real download —
+// unlike HEAD, this surfaces SSE-KMS decrypt requirements and archived
+// (InvalidObjectState) objects as denials rather than false "public" results.
+// A zero-byte object cannot satisfy the range and returns 416; that case falls
+// back to a bounded full GET (the body is empty by definition).
 func ProbeObject(ctx context.Context, c *http.Client, region string, t Target) (AnonResult, error) {
 	rawQuery := ""
 	if t.VersionID != "" {
 		rawQuery = "versionId=" + url.QueryEscape(t.VersionID)
 	}
-	return probeWithRetry(ctx, c, region, t, http.MethodHead, "/"+t.Bucket+"/"+t.Key, rawQuery, "GetObject", true)
+	path := "/" + t.Bucket + "/" + t.Key
+	res, err := probeWithRetry(ctx, c, region, t, path, rawQuery, "bytes=0-0", "GetObject", true)
+	if err != nil {
+		return res, err
+	}
+	if res.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		// Zero-byte object: re-probe without a range. Region is already resolved.
+		res, err = probeWithRetry(ctx, c, res.Region, t, path, rawQuery, "", "GetObject", true)
+	}
+	return res, err
 }
 
-// probeWithRetry performs the anonymous request and, on a wrong-region response
-// that advertises the correct region, retries exactly once against it.
-func probeWithRetry(ctx context.Context, c *http.Client, region string, t Target, method, path, rawQuery, op string, isObject bool) (AnonResult, error) {
+// probeWithRetry performs the anonymous GET and, on a wrong-region response that
+// advertises the correct region, retries exactly once against it. rangeHeader,
+// when non-empty, is sent as the Range request header.
+func probeWithRetry(ctx context.Context, c *http.Client, region string, t Target, path, rawQuery, rangeHeader, op string, isObject bool) (AnonResult, error) {
 	res := AnonResult{Target: t, Region: region, Operation: op}
 
 	for attempt := 0; attempt < 2; attempt++ {
@@ -119,9 +139,12 @@ func probeWithRetry(ctx context.Context, c *http.Client, region string, t Target
 		if rawQuery != "" {
 			u.RawQuery = rawQuery
 		}
-		req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
 			return AnonResult{}, err
+		}
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
 		}
 
 		resp, err := c.Do(req)

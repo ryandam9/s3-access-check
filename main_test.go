@@ -49,6 +49,43 @@ func TestVersionOutput(t *testing.T) {
 	}
 }
 
+func TestScanExitCode(t *testing.T) {
+	cases := []struct {
+		name         string
+		res          ScanResult
+		failIfPublic bool
+		allowPartial bool
+		want         int
+	}{
+		{"complete clean", ScanResult{Complete: true}, true, false, exitNotPublic},
+		{"public wins", ScanResult{Complete: true, PublicCount: 1}, true, false, exitPublic},
+		{"incomplete no public fails closed", ScanResult{Complete: false}, true, false, exitError},
+		{"incomplete allow-partial", ScanResult{Complete: false}, true, true, exitNotPublic},
+		// R2-H-01: fail-if-public=false must not hide incompleteness.
+		{"incomplete + public + failIfPublic=false", ScanResult{Complete: false, PublicCount: 1, InconclusiveCount: 1}, false, false, exitError},
+		// A confirmed public finding still wins when failing on public.
+		{"incomplete + public + failIfPublic=true", ScanResult{Complete: false, PublicCount: 1}, true, false, exitPublic},
+	}
+	for _, tc := range cases {
+		if got := scanExitCode(tc.res, tc.failIfPublic, tc.allowPartial); got != tc.want {
+			t.Errorf("%s: scanExitCode = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSafeDisplay(t *testing.T) {
+	if got := safeDisplay("normal/key"); got != "normal/key" {
+		t.Errorf("plain key changed: %q", got)
+	}
+	got := safeDisplay("evil\nStatus: complete")
+	if strings.Contains(got, "\n") {
+		t.Errorf("newline not escaped: %q", got)
+	}
+	if got := safeDisplay("esc\x1b[2J"); strings.Contains(got, "\x1b") {
+		t.Errorf("ANSI escape not neutralized: %q", got)
+	}
+}
+
 func TestExitForState(t *testing.T) {
 	cases := []struct {
 		state        AccessState
