@@ -4,11 +4,12 @@ import "testing"
 
 func TestParseTarget(t *testing.T) {
 	tests := []struct {
-		in      string
-		bucket  string
-		key     string
-		region  string
-		wantErr bool
+		in        string
+		bucket    string
+		key       string
+		region    string
+		versionID string
+		wantErr   bool
 	}{
 		{in: "s3://my-bucket", bucket: "my-bucket"},
 		{in: "s3://my-bucket/", bucket: "my-bucket"},
@@ -28,10 +29,19 @@ func TestParseTarget(t *testing.T) {
 		// path style
 		{in: "https://s3.us-east-1.amazonaws.com/my-bucket/k", bucket: "my-bucket", key: "k", region: "us-east-1"},
 		{in: "https://s3.amazonaws.com/my-bucket/deep/key", bucket: "my-bucket", key: "deep/key"},
+		// versionId is captured
+		{in: "https://b-ucket.s3.amazonaws.com/k?versionId=abc123", bucket: "b-ucket", key: "k", versionID: "abc123"},
+		// encoded path is preserved to the correct S3 key
+		{in: "https://b-ucket.s3.amazonaws.com/a%20b", bucket: "b-ucket", key: "a b"},
+		{in: "https://b-ucket.s3.amazonaws.com/a%25b", bucket: "b-ucket", key: "a%b"},
+		// legacy bucket names (uppercase / underscore) are accepted
+		{in: "s3://Legacy_Bucket.Name", bucket: "Legacy_Bucket.Name"},
 		// errors
 		{in: "", wantErr: true},
 		{in: "s3://", wantErr: true},
-		{in: "ab", wantErr: true}, // too short
+		{in: "ab", wantErr: true},                                                     // too short
+		{in: "https://minio.example/my-bucket/key", wantErr: true},                    // unknown host
+		{in: "https://my-bucket.s3.amazonaws.com/k?X-Amz-Signature=x", wantErr: true}, // signed URL
 	}
 
 	for _, tc := range tests {
@@ -49,8 +59,11 @@ func TestParseTarget(t *testing.T) {
 			if got.Bucket != tc.bucket || got.Key != tc.key {
 				t.Errorf("bucket/key = %q/%q, want %q/%q", got.Bucket, got.Key, tc.bucket, tc.key)
 			}
-			if tc.region != "" && got.Region != tc.region {
+			if got.Region != tc.region {
 				t.Errorf("region = %q, want %q", got.Region, tc.region)
+			}
+			if got.VersionID != tc.versionID {
+				t.Errorf("versionId = %q, want %q", got.VersionID, tc.versionID)
 			}
 		})
 	}
