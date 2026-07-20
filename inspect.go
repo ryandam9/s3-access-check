@@ -21,10 +21,10 @@ import (
 type InspectResult struct {
 	Target Target `json:"target"`
 
-	BucketPublicAccessBlock  *PublicAccessBlock `json:"bucketPublicAccessBlock,omitempty"`
-	AccountPublicAccessBlock *PublicAccessBlock `json:"accountPublicAccessBlock,omitempty"`
-	BucketPolicy             PolicyInfo         `json:"bucketPolicy"`
-	ACL                      ACLInfo            `json:"acl"`
+	BucketPublicAccessBlock        *PublicAccessBlock `json:"bucketPublicAccessBlock,omitempty"`
+	CallerAccountPublicAccessBlock *PublicAccessBlock `json:"callerAccountPublicAccessBlock,omitempty"`
+	BucketPolicy                   PolicyInfo         `json:"bucketPolicy"`
+	ACL                            ACLInfo            `json:"acl"`
 
 	Errors   map[string]string `json:"errors,omitempty"`
 	Warnings []string          `json:"warnings,omitempty"`
@@ -123,19 +123,20 @@ func inspectAccountPAB(ctx context.Context, cfg aws.Config, res *InspectResult) 
 		return
 	}
 	acct := aws.ToString(id.Account)
+	res.Warnings = append(res.Warnings, "Block Public Access below is the AUTHENTICATED CALLER's account ("+acct+"); target-bucket ownership is not verified, so for a cross-account bucket this may not be the owning account's configuration")
 	pab, err := s3control.NewFromConfig(cfg).GetPublicAccessBlock(ctx, &s3control.GetPublicAccessBlockInput{
 		AccountId: aws.String(acct),
 	})
 	if err != nil {
 		if isAWSCode(err, "NoSuchPublicAccessBlockConfiguration") {
-			res.AccountPublicAccessBlock = &PublicAccessBlock{Configured: false}
+			res.CallerAccountPublicAccessBlock = &PublicAccessBlock{Configured: false}
 			return
 		}
-		res.Warnings = append(res.Warnings, "account-level Block Public Access not inspected: "+friendlyErr(err))
+		res.Warnings = append(res.Warnings, "caller-account Block Public Access not inspected: "+friendlyErr(err))
 		return
 	}
 	if c := pab.PublicAccessBlockConfiguration; c != nil {
-		res.AccountPublicAccessBlock = &PublicAccessBlock{
+		res.CallerAccountPublicAccessBlock = &PublicAccessBlock{
 			Configured:            true,
 			BlockPublicACLs:       aws.ToBool(c.BlockPublicAcls),
 			IgnorePublicACLs:      aws.ToBool(c.IgnorePublicAcls),
@@ -143,7 +144,7 @@ func inspectAccountPAB(ctx context.Context, cfg aws.Config, res *InspectResult) 
 			RestrictPublicBuckets: aws.ToBool(c.RestrictPublicBuckets),
 		}
 	}
-	res.Warnings = append(res.Warnings, "account-level results may still inherit stricter organization (SCP) policy that is not visible here")
+	res.Warnings = append(res.Warnings, "the account-level result is the effective caller-account configuration and may be enforced by an AWS Organizations S3 policy; the API does not identify the source")
 }
 
 func inspectPolicyStatus(ctx context.Context, client *s3.Client, t Target, res *InspectResult) {
@@ -165,7 +166,13 @@ func inspectPolicyStatus(ctx context.Context, client *s3.Client, t Target, res *
 func inspectACL(ctx context.Context, client *s3.Client, t Target, res *InspectResult) {
 	var grants []s3types.Grant
 	if t.IsObject() {
-		acl, err := client.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: aws.String(t.Bucket), Key: aws.String(t.Key)})
+		in := &s3.GetObjectAclInput{Bucket: aws.String(t.Bucket), Key: aws.String(t.Key)}
+		if t.VersionID != "" {
+			// Inspect the same version the anonymous probe targeted (requires
+			// s3:GetObjectVersionAcl).
+			in.VersionId = aws.String(t.VersionID)
+		}
+		acl, err := client.GetObjectAcl(ctx, in)
 		if err != nil {
 			res.Errors["objectAcl"] = friendlyErr(err)
 			return
