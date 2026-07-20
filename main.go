@@ -2,7 +2,8 @@
 // (publicly) accessible. Its primary check is a black-box, unauthenticated
 // probe that reflects the resource's real, effective access state. With
 // --inspect it additionally reads the AWS configuration (Block Public Access,
-// bucket policy status, and ACLs) to explain why.
+// bucket policy status, and ACLs) to explain why; with --scan it enumerates a
+// bucket's objects and probes each anonymously.
 //
 // Use it only against buckets and objects you own or are authorized to test.
 package main
@@ -12,62 +13,109 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sort"
 	"time"
 )
 
+// version is overridable at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
+// schemaVersion identifies the JSON output contract so automation can detect
+// breaking changes.
+const schemaVersion = 1
+
 // Exit codes let the tool drive scripts and CI:
 //
-//	0  not public
+//	0  not public (definitively)
 //	1  public (anonymously accessible)
-//	2  usage or runtime error
+//	2  inconclusive, usage, or runtime error
 const (
 	exitNotPublic = 0
 	exitPublic    = 1
 	exitError     = 2
 )
 
-// Report is the combined machine-readable output (--json).
+// Report is the combined machine-readable output for a single-target check.
 type Report struct {
-	Target    string         `json:"target"`
-	Public    bool           `json:"public"`
-	Operation string         `json:"operation"`
-	Region    string         `json:"region"`
-	Status    int            `json:"httpStatus"`
-	S3Code    string         `json:"s3Code,omitempty"`
-	Exists    *bool          `json:"exists,omitempty"`
-	Inspect   *InspectResult `json:"inspect,omitempty"`
+	SchemaVersion int            `json:"schemaVersion"`
+	ToolVersion   string         `json:"toolVersion"`
+	Target        string         `json:"target"`
+	State         AccessState    `json:"state"`
+	Public        bool           `json:"public"`
+	Operation     string         `json:"operation"`
+	Region        string         `json:"region"`
+	Status        int            `json:"httpStatus,omitempty"`
+	S3Code        string         `json:"s3Code,omitempty"`
+	Exists        *bool          `json:"exists,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Inspect       *InspectResult `json:"inspect,omitempty"`
+}
+
+// ScanReport wraps a ScanResult with output metadata.
+type ScanReport struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	ToolVersion   string `json:"toolVersion"`
+	ScanResult
 }
 
 func main() {
-	os.Exit(run())
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run() int {
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("s3-access-check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
 	var (
-		inspect      = flag.Bool("inspect", false, "also read AWS config (Block Public Access, policy status, ACLs) to explain the result; requires AWS credentials")
-		asJSON       = flag.Bool("json", false, "emit the result as JSON")
-		region       = flag.String("region", "", "override the S3 region instead of auto-detecting it")
-		timeout      = flag.Duration("timeout", 15*time.Second, "overall timeout for network requests")
-		failIfPublic = flag.Bool("fail-if-public", true, "exit 1 when the target is public (set to false to always exit 0 on success)")
+		inspect        = fs.Bool("inspect", false, "also read AWS config (Block Public Access, policy status, ACLs) to explain the result; requires AWS credentials")
+		asJSON         = fs.Bool("json", false, "emit the result as JSON")
+		region         = fs.String("region", "", "override the S3 region instead of auto-detecting it")
+		requestTimeout = fs.Duration("request-timeout", 15*time.Second, "timeout for each individual HTTP/AWS request")
+		timeout        = fs.Duration("timeout", 60*time.Second, "overall timeout for the whole operation (raise this for large scans)")
+		failIfPublic   = fs.Bool("fail-if-public", true, "exit 1 when the target (or, in scan mode, any object) is public")
+		showVersion    = fs.Bool("version", false, "print version and exit")
 
-		scan        = flag.Bool("scan", false, "scan every object in a bucket and report which are anonymously accessible (even when the bucket is not publicly listable)")
-		prefix      = flag.String("prefix", "", "with --scan, only enumerate keys under this prefix")
-		maxObjects  = flag.Int("max-objects", 1000, "with --scan, stop after enumerating this many objects (0 = no limit)")
-		concurrency = flag.Int("concurrency", 16, "with --scan, number of concurrent anonymous probes")
-		keysFrom    = flag.String("keys-from", "", "with --scan, read candidate keys from this file instead of the S3 API (no AWS credentials required)")
+		scan         = fs.Bool("scan", false, "scan every object in a bucket and report which are anonymously accessible (even when the bucket is not publicly listable)")
+		prefix       = fs.String("prefix", "", "with --scan, only enumerate keys under this prefix")
+		maxObjects   = fs.Int("max-objects", 1000, "with --scan, stop after enumerating this many objects (0 = no limit)")
+		concurrency  = fs.Int("concurrency", 16, "with --scan, number of concurrent anonymous probes (1-256)")
+		keysFrom     = fs.String("keys-from", "", "with --scan, read candidate keys from this file instead of the S3 API (no AWS credentials required)")
+		allowPartial = fs.Bool("allow-partial", false, "with --scan, exit 0 for a truncated/incomplete scan that found no public object (default: incomplete scans exit 2)")
 	)
-	flag.Usage = usage
-	flag.Parse()
+	fs.Usage = func() { usage(stderr, fs) }
 
-	if flag.NArg() != 1 {
-		usage()
+	if err := fs.Parse(args); err != nil {
+		return exitError
+	}
+	if *showVersion {
+		fmt.Fprintf(stdout, "s3-access-check %s\n", version)
+		return exitNotPublic
+	}
+
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	if fs.NArg() != 1 {
+		usage(stderr, fs)
 		return exitError
 	}
 
-	target, err := ParseTarget(flag.Arg(0))
+	// Validate flag values and combinations.
+	if *timeout <= 0 || *requestTimeout <= 0 {
+		fmt.Fprintln(stderr, "error: --timeout and --request-timeout must be positive")
+		return exitError
+	}
+	if err := validateScanFlags(*scan, *inspect, *maxObjects, *concurrency, set); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return exitError
+	}
+
+	target, err := ParseTarget(fs.Arg(0))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitError
 	}
 	if *region != "" {
@@ -76,13 +124,14 @@ func run() int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	client := anonymousClient(*requestTimeout)
 
 	if *scan {
 		if target.IsObject() {
-			fmt.Fprintln(os.Stderr, "error: --scan operates on a bucket; drop the object key from the target")
+			fmt.Fprintln(stderr, "error: --scan operates on a bucket; drop the object key from the target")
 			return exitError
 		}
-		return runScan(ctx, target, *asJSON, *failIfPublic, ScanOptions{
+		return runScan(ctx, stdout, stderr, client, target, *asJSON, *failIfPublic, *allowPartial, ScanOptions{
 			Prefix:      *prefix,
 			MaxObjects:  *maxObjects,
 			Concurrency: *concurrency,
@@ -91,159 +140,274 @@ func run() int {
 		})
 	}
 
-	anon, err := CheckAnonymous(ctx, anonymousClient(), target)
+	return runCheck(ctx, stdout, stderr, client, target, *inspect, *asJSON, *failIfPublic)
+}
+
+func validateScanFlags(scan, inspect bool, maxObjects, concurrency int, set map[string]bool) error {
+	if scan {
+		if inspect {
+			return fmt.Errorf("--inspect is not supported with --scan")
+		}
+		if maxObjects < 0 {
+			return fmt.Errorf("--max-objects must be >= 0")
+		}
+		if concurrency < 1 || concurrency > 256 {
+			return fmt.Errorf("--concurrency must be between 1 and 256")
+		}
+		return nil
+	}
+	// Reject scan-only flags outside scan mode so a user is never misled into
+	// thinking a limit or filter was applied.
+	for _, name := range []string{"prefix", "max-objects", "concurrency", "keys-from", "allow-partial"} {
+		if set[name] {
+			return fmt.Errorf("--%s requires --scan", name)
+		}
+	}
+	return nil
+}
+
+func runCheck(ctx context.Context, stdout, stderr io.Writer, client *http.Client, target Target, inspect, asJSON, failIfPublic bool) int {
+	anon, err := CheckAnonymous(ctx, client, target)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitError
 	}
 
 	report := Report{
-		Target:    target.String(),
-		Public:    anon.Public,
-		Operation: anon.Operation,
-		Region:    anon.Region,
-		Status:    anon.StatusCode,
-		S3Code:    anon.S3Code,
-		Exists:    anon.Exists,
+		SchemaVersion: schemaVersion,
+		ToolVersion:   version,
+		Target:        target.String(),
+		State:         anon.State,
+		Public:        anon.Public(),
+		Operation:     anon.Operation,
+		Region:        anon.Region,
+		Status:        anon.StatusCode,
+		S3Code:        anon.S3Code,
+		Exists:        anon.Exists,
+		Error:         anon.Err,
 	}
 
-	if *inspect {
+	if inspect {
 		ins, err := Inspect(ctx, target, anon.Region)
 		if err != nil {
-			// Inspection is best-effort; surface the reason but do not fail the
-			// whole run — the anonymous verdict still stands.
-			fmt.Fprintf(os.Stderr, "warning: config inspection skipped: %v\n", err)
+			fmt.Fprintf(stderr, "warning: config inspection skipped: %v\n", err)
+			report.Inspect = &InspectResult{Target: target, Errors: map[string]string{"inspection": err.Error()}}
 		} else {
 			report.Inspect = &ins
 		}
 	}
 
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(report); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	if asJSON {
+		if err := writeJSON(stdout, report); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			return exitError
 		}
 	} else {
-		printHuman(report, anon)
+		printHuman(stdout, report, anon)
 	}
 
-	if anon.Public && *failIfPublic {
-		return exitPublic
-	}
-	return exitNotPublic
+	return exitForState(anon.State, failIfPublic)
 }
 
-func runScan(ctx context.Context, target Target, asJSON, failIfPublic bool, opts ScanOptions) int {
+func exitForState(state AccessState, failIfPublic bool) int {
+	switch state {
+	case AccessPublic:
+		if failIfPublic {
+			return exitPublic
+		}
+		return exitNotPublic
+	case AccessNotPublic:
+		return exitNotPublic
+	default:
+		return exitError
+	}
+}
+
+func runScan(ctx context.Context, stdout, stderr io.Writer, client *http.Client, target Target, asJSON, failIfPublic, allowPartial bool, opts ScanOptions) int {
 	// Resolve region once up front so the per-object probes reuse it.
 	if opts.Region == "" {
-		r, err := ResolveRegion(ctx, anonymousClient(), target.Bucket)
+		r, err := ResolveRegion(ctx, client, target.Bucket)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: resolving region: %v\n", err)
+			fmt.Fprintf(stderr, "error: resolving region: %v\n", err)
 			return exitError
 		}
 		opts.Region = r
 	}
 
-	res, err := ScanBucket(ctx, anonymousClient(), target.Bucket, opts)
+	res, err := ScanBucket(ctx, client, target.Bucket, opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitError
 	}
 
 	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(res); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if err := writeJSON(stdout, ScanReport{SchemaVersion: schemaVersion, ToolVersion: version, ScanResult: res}); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			return exitError
 		}
 	} else {
-		printScan(res)
+		printScan(stdout, res)
 	}
 
-	if len(res.PublicObjects) > 0 && failIfPublic {
-		return exitPublic
+	if res.PublicCount > 0 {
+		if failIfPublic {
+			return exitPublic
+		}
+		return exitNotPublic
 	}
-	return exitNotPublic
+	// No public object found. Only exit 0 if the scan was actually complete
+	// (or the user explicitly accepts partial results).
+	if res.Complete || allowPartial {
+		return exitNotPublic
+	}
+	return exitError
 }
 
-func printScan(r ScanResult) {
-	fmt.Printf("Bucket:    s3://%s\n", r.Bucket)
-	fmt.Printf("Region:    %s\n", r.Region)
-	fmt.Printf("Source:    %s (enumerated %d, probed %d objects)\n", r.Source, r.Enumerated, r.Probed)
-	if r.Truncated {
-		fmt.Println("Note:      enumeration hit the --max-objects limit; more objects were not scanned")
-	}
-	if len(r.PublicObjects) == 0 {
-		fmt.Println("Result:    no anonymously accessible objects found")
-		return
-	}
-	fmt.Printf("Result:    %d PUBLIC object(s) found:\n", len(r.PublicObjects))
-	for _, o := range r.PublicObjects {
-		fmt.Printf("  PUBLIC  s3://%s/%s  (HTTP %d)\n", r.Bucket, o.Key, o.Status)
-	}
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }
 
-func printHuman(r Report, anon AnonResult) {
-	verdict := "NOT PUBLIC"
-	if r.Public {
-		verdict = "PUBLIC"
-	}
+func printHuman(w io.Writer, r Report, anon AnonResult) {
 	kind := "bucket"
 	if anon.Target.IsObject() {
 		kind = "object"
 	}
 
-	fmt.Printf("Target:    %s (%s)\n", r.Target, kind)
-	fmt.Printf("Region:    %s\n", r.Region)
-	fmt.Printf("Anonymous: %s  (%s -> HTTP %d", verdict, r.Operation, r.Status)
+	fmt.Fprintf(w, "Target:    %s (%s)\n", r.Target, kind)
+	fmt.Fprintf(w, "Region:    %s\n", r.Region)
+	fmt.Fprintf(w, "Anonymous: %s  (%s -> HTTP %d", r.State.Verdict(), r.Operation, r.Status)
 	if r.S3Code != "" {
-		fmt.Printf(" %s", r.S3Code)
+		fmt.Fprintf(w, " %s", r.S3Code)
 	}
-	fmt.Print(")\n")
+	fmt.Fprint(w, ")\n")
 
+	if r.State == AccessInconclusive {
+		fmt.Fprintf(w, "Note:      result is INCONCLUSIVE — could not determine access (%s)\n", r.Error)
+	}
 	if r.Exists != nil && !*r.Exists {
-		fmt.Println("Note:      the resource does not appear to exist")
+		fmt.Fprintln(w, "Note:      the resource does not appear to exist")
 	}
 
 	if r.Public {
 		if anon.Target.IsObject() {
-			fmt.Println("Meaning:   anyone can download this object without credentials")
+			fmt.Fprintln(w, "Meaning:   anyone can download this object without credentials")
 		} else {
-			fmt.Println("Meaning:   anyone can list this bucket's contents without credentials")
-			fmt.Println("           (individual objects may have different, separate permissions)")
+			fmt.Fprintln(w, "Meaning:   anyone can list this bucket's contents without credentials")
+			fmt.Fprintln(w, "           (individual objects may have different, separate permissions)")
 		}
 	}
 
 	if r.Inspect != nil {
-		printInspect(*r.Inspect)
+		printInspect(w, *r.Inspect)
 	}
 }
 
-func printInspect(ins InspectResult) {
-	fmt.Println("\nConfiguration (authenticated):")
-	if pab := ins.PublicAccessBlock; pab != nil {
-		fmt.Printf("  Block Public Access: acls=%t ignoreAcls=%t policy=%t restrict=%t\n",
-			pab.BlockPublicACLs, pab.IgnorePublicACLs, pab.BlockPublicPolicy, pab.RestrictPublicBuckets)
+func printInspect(w io.Writer, ins InspectResult) {
+	fmt.Fprintln(w, "\nConfiguration (authenticated):")
+	printPAB(w, "  Bucket Block Public Access:", ins.BucketPublicAccessBlock)
+	printPAB(w, "  Account Block Public Access:", ins.AccountPublicAccessBlock)
+
+	if ins.BucketPolicy.Present {
+		if ins.BucketPolicy.Public != nil {
+			fmt.Fprintf(w, "  Bucket policy:        present, public=%t\n", *ins.BucketPolicy.Public)
+		} else {
+			fmt.Fprintln(w, "  Bucket policy:        present")
+		}
+	} else {
+		fmt.Fprintln(w, "  Bucket policy:        none")
 	}
-	if ins.PolicyIsPublic != nil {
-		fmt.Printf("  Bucket policy public: %t\n", *ins.PolicyIsPublic)
+
+	if ins.ACL.AllowsAnonymousOperation != nil {
+		fmt.Fprintf(w, "  ACL allows anon read: %t\n", *ins.ACL.AllowsAnonymousOperation)
 	}
-	if ins.ACLGrantsPublic != nil {
-		fmt.Printf("  ACL grants public:    %t\n", *ins.ACLGrantsPublic)
-		if len(ins.ACLGrantees) > 0 {
-			fmt.Printf("  Public grantees:      %v\n", ins.ACLGrantees)
+	if len(ins.ACL.AnonymousGrants) > 0 {
+		fmt.Fprintf(w, "  Anonymous ACL grants: %v\n", ins.ACL.AnonymousGrants)
+	}
+	if len(ins.ACL.AuthenticatedAWSUsersGrants) > 0 {
+		fmt.Fprintf(w, "  AuthenticatedUsers ACL grants (any AWS account, not anonymous): %v\n", ins.ACL.AuthenticatedAWSUsersGrants)
+	}
+
+	for _, warn := range ins.Warnings {
+		fmt.Fprintf(w, "  warning: %s\n", warn)
+	}
+	// Deterministic ordering for stable output.
+	keys := make([]string, 0, len(ins.Errors))
+	for k := range ins.Errors {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(w, "  %s: unavailable (%s)\n", k, ins.Errors[k])
+	}
+}
+
+func printPAB(w io.Writer, label string, pab *PublicAccessBlock) {
+	if pab == nil {
+		fmt.Fprintf(w, "%s unknown\n", label)
+		return
+	}
+	if !pab.Configured {
+		fmt.Fprintf(w, "%s not configured\n", label)
+		return
+	}
+	fmt.Fprintf(w, "%s acls=%t ignoreAcls=%t policy=%t restrict=%t\n",
+		label, pab.BlockPublicACLs, pab.IgnorePublicACLs, pab.BlockPublicPolicy, pab.RestrictPublicBuckets)
+}
+
+func printScan(w io.Writer, r ScanResult) {
+	fmt.Fprintf(w, "Bucket:    s3://%s\n", r.Bucket)
+	fmt.Fprintf(w, "Region:    %s\n", r.Region)
+	fmt.Fprintf(w, "Source:    %s\n", r.Source)
+	fmt.Fprintf(w, "Coverage:  enumerated %d, completed %d (public %d, not-public %d, inconclusive %d)\n",
+		r.Enumerated, r.Completed, r.PublicCount, r.NotPublicCount, r.InconclusiveCount)
+
+	if !r.Complete {
+		reasons := []string{}
+		if r.Truncated {
+			reasons = append(reasons, "hit --max-objects limit")
+		}
+		if r.Cancelled {
+			reasons = append(reasons, "timed out / cancelled")
+		}
+		if r.InconclusiveCount > 0 {
+			reasons = append(reasons, fmt.Sprintf("%d probe(s) inconclusive", r.InconclusiveCount))
+		}
+		fmt.Fprintf(w, "Status:    INCOMPLETE (%s) — a clean result here does NOT certify the bucket\n", joinReasons(reasons))
+	} else {
+		fmt.Fprintln(w, "Status:    complete")
+	}
+
+	if len(r.PublicObjects) == 0 {
+		fmt.Fprintln(w, "Result:    no anonymously accessible objects found in what was checked")
+	} else {
+		fmt.Fprintf(w, "Result:    %d PUBLIC object(s) found:\n", len(r.PublicObjects))
+		for _, o := range r.PublicObjects {
+			fmt.Fprintf(w, "  PUBLIC  s3://%s/%s  (HTTP %d)\n", r.Bucket, o.Key, o.Status)
 		}
 	}
-	for check, msg := range ins.Errors {
-		fmt.Printf("  %s: unavailable (%s)\n", check, msg)
+	if len(r.Failures) > 0 {
+		fmt.Fprintf(w, "  %d object(s) could not be checked (inconclusive):\n", len(r.Failures))
+		for _, o := range r.Failures {
+			fmt.Fprintf(w, "  INCONCLUSIVE  s3://%s/%s  (%s)\n", r.Bucket, o.Key, o.Err)
+		}
 	}
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `s3-access-check - report whether an S3 bucket or object is anonymously accessible
+func joinReasons(reasons []string) string {
+	if len(reasons) == 0 {
+		return "incomplete"
+	}
+	out := reasons[0]
+	for _, r := range reasons[1:] {
+		out += "; " + r
+	}
+	return out
+}
+
+func usage(w io.Writer, fs *flag.FlagSet) {
+	fmt.Fprintf(w, `s3-access-check - report whether an S3 bucket or object is anonymously accessible
 
 Usage:
   s3-access-check [flags] <target>
@@ -262,12 +426,12 @@ itself is not publicly listable):
 
 Flags:
 `)
-	flag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, `
+	fs.PrintDefaults()
+	fmt.Fprintf(w, `
 Exit codes:
-  0  not public
+  0  not public (definitively)
   1  public
-  2  error
+  2  inconclusive, usage, or error
 
 Only run this against buckets and objects you own or are authorized to test.
 `)

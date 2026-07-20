@@ -1,0 +1,68 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestRunFlagValidation(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantExit int
+		wantErr  string // substring expected on stderr (empty = don't check)
+	}{
+		{"no args", nil, exitError, ""},
+		{"version", []string{"--version"}, exitNotPublic, ""},
+		{"prefix requires scan", []string{"--prefix=x", "s3://my-bucket"}, exitError, "--prefix requires --scan"},
+		{"keys-from requires scan", []string{"--keys-from=k.txt", "s3://my-bucket"}, exitError, "--keys-from requires --scan"},
+		{"inspect with scan", []string{"--inspect", "--scan", "s3://my-bucket"}, exitError, "--inspect is not supported with --scan"},
+		{"bad concurrency", []string{"--scan", "--concurrency=0", "s3://my-bucket"}, exitError, "--concurrency must be between 1 and 256"},
+		{"negative max", []string{"--scan", "--max-objects=-1", "s3://my-bucket"}, exitError, "--max-objects must be >= 0"},
+		{"zero timeout", []string{"--timeout=0", "s3://my-bucket"}, exitError, "must be positive"},
+		{"scan on object", []string{"--scan", "s3://my-bucket/key"}, exitError, "--scan operates on a bucket"},
+		{"unknown host", []string{"https://minio.example/b/k"}, exitError, "unsupported endpoint host"},
+		{"signed url", []string{"https://b-ucket.s3.amazonaws.com/k?X-Amz-Signature=x"}, exitError, "signed/presigned"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			got := run(tc.args, &out, &errb)
+			if got != tc.wantExit {
+				t.Errorf("exit = %d, want %d (stderr: %s)", got, tc.wantExit, errb.String())
+			}
+			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
+				t.Errorf("stderr %q does not contain %q", errb.String(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVersionOutput(t *testing.T) {
+	var out, errb bytes.Buffer
+	if got := run([]string{"--version"}, &out, &errb); got != exitNotPublic {
+		t.Fatalf("exit = %d", got)
+	}
+	if !strings.Contains(out.String(), "s3-access-check") {
+		t.Errorf("version output = %q", out.String())
+	}
+}
+
+func TestExitForState(t *testing.T) {
+	cases := []struct {
+		state        AccessState
+		failIfPublic bool
+		want         int
+	}{
+		{AccessPublic, true, exitPublic},
+		{AccessPublic, false, exitNotPublic},
+		{AccessNotPublic, true, exitNotPublic},
+		{AccessInconclusive, true, exitError},
+	}
+	for _, tc := range cases {
+		if got := exitForState(tc.state, tc.failIfPublic); got != tc.want {
+			t.Errorf("exitForState(%q, %v) = %d, want %d", tc.state, tc.failIfPublic, got, tc.want)
+		}
+	}
+}

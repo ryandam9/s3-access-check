@@ -11,9 +11,10 @@ import (
 // targets the bucket itself (a public-listability check); a non-empty Key
 // targets a single object (a public-read check).
 type Target struct {
-	Bucket string
-	Key    string
-	Region string // optional hint parsed from a URL; may be empty
+	Bucket    string `json:"bucket"`
+	Key       string `json:"key,omitempty"`
+	Region    string `json:"region,omitempty"` // optional hint parsed from a URL; may be empty
+	VersionID string `json:"versionId,omitempty"`
 }
 
 // IsObject reports whether the target refers to a specific object rather than
@@ -27,10 +28,6 @@ func (t Target) String() string {
 	return fmt.Sprintf("s3://%s", t.Bucket)
 }
 
-// hostStyle matches the host portion of an S3 endpoint and captures the region
-// when present. It covers both the modern dot form (s3.us-east-1.amazonaws.com)
-// and the legacy dash form (s3-us-west-2.amazonaws.com), with or without a
-// bucket prefix for virtual-hosted-style URLs.
 var (
 	// e.g. "s3", "s3.us-east-1", "s3-eu-west-1", "s3.dualstack.us-east-1"
 	regionRe = regexp.MustCompile(`^s3[.-](?:dualstack[.-])?([a-z0-9-]+)$`)
@@ -43,6 +40,10 @@ var (
 //	https://s3.region.amazonaws.com/bucket/key   (path style)
 //	bucket
 //	bucket/key
+//
+// Only AWS S3 endpoints (*.amazonaws.com) are accepted for URL inputs; an
+// unrecognized host is rejected rather than silently reinterpreted as an AWS
+// bucket name.
 func ParseTarget(input string) (Target, error) {
 	raw := strings.TrimSpace(input)
 	if raw == "" {
@@ -83,40 +84,82 @@ func splitBucketKey(rest string) (Target, error) {
 	return Target{Bucket: bucket, Key: key}, nil
 }
 
+// authQueryParams are request-signing parameters that must never appear on an
+// anonymous probe target; their presence means the user pasted a presigned or
+// signed URL.
+var authQueryParams = []string{
+	"X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token",
+	"X-Amz-Algorithm", "AWSAccessKeyId", "Signature",
+}
+
 func parseHTTPURL(raw string) (Target, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return Target{}, fmt.Errorf("invalid URL: %w", err)
 	}
-	host := u.Hostname()
-	path := strings.TrimPrefix(u.Path, "/")
+	host := strings.ToLower(u.Hostname())
 
-	// Try to peel a "*.amazonaws.com" suffix so the remaining labels describe
-	// the endpoint. Non-AWS hosts (e.g. custom S3-compatible endpoints) fall
-	// back to path-style parsing.
-	const suffix = ".amazonaws.com"
-	if strings.HasSuffix(host, suffix) {
-		labels := strings.TrimSuffix(host, suffix)
-		if region, isPath := matchEndpoint(labels); isPath {
-			// path style: https://s3.region.amazonaws.com/bucket/key
-			t, err := splitBucketKey(path)
-			if err != nil {
-				return Target{}, err
-			}
-			t.Region = region
-			return t, nil
-		}
-		// virtual-hosted style: bucket.s3.region.amazonaws.com
-		if bucket, region, ok := matchVirtualHosted(labels); ok {
-			if err := validateBucket(bucket); err != nil {
-				return Target{}, err
-			}
-			return Target{Bucket: bucket, Key: path, Region: region}, nil
-		}
+	// Use the escaped path so encoded separators survive; strip exactly one
+	// leading slash without decoding the remainder.
+	path := strings.TrimPrefix(u.EscapedPath(), "/")
+	key, err := url.PathUnescape(path)
+	if err != nil {
+		return Target{}, fmt.Errorf("invalid escaped path %q: %w", path, err)
 	}
 
-	// Unknown host shape: treat as path-style (bucket is first path segment).
-	return splitBucketKey(path)
+	q := u.Query()
+	for _, p := range authQueryParams {
+		if q.Has(p) {
+			return Target{}, fmt.Errorf("target looks like a signed/presigned URL (%s present); pass an unsigned S3 path instead", p)
+		}
+	}
+	versionID := q.Get("versionId")
+
+	const suffix = ".amazonaws.com"
+	if !strings.HasSuffix(host, suffix) {
+		return Target{}, fmt.Errorf("unsupported endpoint host %q: only AWS S3 (*.amazonaws.com) URLs are supported", u.Hostname())
+	}
+
+	labels := strings.TrimSuffix(host, suffix)
+	if region, isPath := matchEndpoint(labels); isPath {
+		// path style: https://s3.region.amazonaws.com/bucket/key
+		t, err := splitEscapedBucketKey(path)
+		if err != nil {
+			return Target{}, err
+		}
+		t.Region = region
+		t.VersionID = versionID
+		return t, nil
+	}
+	if bucket, region, ok := matchVirtualHosted(labels); ok {
+		// virtual-hosted style: bucket.s3.region.amazonaws.com
+		if err := validateBucket(bucket); err != nil {
+			return Target{}, err
+		}
+		return Target{Bucket: bucket, Key: key, Region: region, VersionID: versionID}, nil
+	}
+	return Target{}, fmt.Errorf("unrecognized S3 endpoint host %q", u.Hostname())
+}
+
+// splitEscapedBucketKey splits an escaped path-style "bucket/key" path, decoding
+// only the key portion.
+func splitEscapedBucketKey(escapedPath string) (Target, error) {
+	bucketEsc, keyEsc, _ := strings.Cut(escapedPath, "/")
+	bucket, err := url.PathUnescape(bucketEsc)
+	if err != nil {
+		return Target{}, fmt.Errorf("invalid bucket in path: %w", err)
+	}
+	key, err := url.PathUnescape(keyEsc)
+	if err != nil {
+		return Target{}, fmt.Errorf("invalid key in path: %w", err)
+	}
+	if bucket == "" {
+		return Target{}, fmt.Errorf("no bucket in target")
+	}
+	if err := validateBucket(bucket); err != nil {
+		return Target{}, err
+	}
+	return Target{Bucket: bucket, Key: key}, nil
 }
 
 // matchEndpoint reports whether labels (host minus ".amazonaws.com") is a bare
@@ -157,14 +200,19 @@ func matchVirtualHosted(labels string) (bucket, region string, ok bool) {
 	return bucket, region, bucket != ""
 }
 
-// validateBucket applies the basic S3 bucket naming rules so obviously invalid
-// input fails fast with a clear message instead of a confusing HTTP error.
+// validateBucket applies conservative naming rules. It intentionally accepts
+// legacy identifiers (uppercase, underscore) that predate the 2018 rules and
+// may still exist, rejecting only what would make safe request construction
+// impossible.
 func validateBucket(b string) error {
 	if len(b) < 3 || len(b) > 63 {
 		return fmt.Errorf("bucket name %q must be 3-63 characters", b)
 	}
 	for _, r := range b {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9', r == '-', r == '.', r == '_':
+		default:
 			return fmt.Errorf("bucket name %q contains invalid character %q", b, r)
 		}
 	}

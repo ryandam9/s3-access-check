@@ -8,19 +8,38 @@ no credentials and reads the result. This reflects the resource's real,
 effective access state — the same thing an anonymous visitor on the internet
 would experience — regardless of *how* that access was configured (bucket
 policy, ACL, or Block Public Access). With `--inspect` it can additionally read
-the AWS configuration to explain *why*.
+the AWS configuration to explain *why*, and with `--scan` it can probe every
+object in a bucket.
 
 > **Use responsibly.** Only run this against buckets and objects you own or are
 > explicitly authorized to test. Pointed at arbitrary buckets, an access probe
 > is reconnaissance.
 
-## Install / build
+## Results are three-valued
+
+Because this is a security tool, it never conflates "proven not public" with
+"couldn't tell". Every check yields one of:
+
+| State | Meaning | Exit code |
+| --- | --- | --- |
+| **public** | an anonymous request succeeded | `1` |
+| **not_public** | an anonymous request was definitively denied (`403`) or the resource is absent (`404`) | `0` |
+| **inconclusive** | the check could not determine access — redirect loop, throttling (`429`), `5xx`, timeout, transport error, or any unexpected status | `2` |
+
+> **Failure to prove public access is not the same as proving a resource is not
+> public.** An `inconclusive` result (exit `2`) must not be read as "safe".
+
+## Install
+
+```sh
+go install github.com/ryandam9/s3-access-check@latest
+```
+
+or build from source (Go 1.24+):
 
 ```sh
 go build -o s3-access-check .
 ```
-
-Requires Go 1.24+.
 
 ## Usage
 
@@ -38,30 +57,49 @@ Accepted target formats:
 | Bare bucket | `my-bucket` |
 | Bucket + key | `my-bucket/key.txt` |
 
+Only AWS S3 hosts (`*.amazonaws.com`) are accepted in URLs; an unknown host is
+rejected rather than silently reinterpreted as an AWS bucket name. Signed or
+presigned URLs are rejected — the tool must remain anonymous. A `versionId`
+query parameter is honored for object checks.
+
 If the target has no key, the **bucket** is checked for public *listability*.
-If it has a key, that **object** is checked for public *readability*. These are
-separate permissions — a private bucket can hold public objects and vice versa.
+If it has a key, that **object** is checked for public *readability* (via an
+anonymous `HEAD`, which needs the same permission as `GET`, returns no body, and
+correctly handles zero-byte objects). These are separate permissions — a private
+bucket can hold public objects and vice versa.
 
 ### Flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-inspect` | `false` | Also read AWS config (Block Public Access, bucket policy status, ACLs) to explain the result. Requires AWS credentials and read permissions; only works on buckets in your account. |
-| `-scan` | `false` | Scan every object in a bucket and report which are anonymously accessible, even when the bucket itself is not publicly listable. See below. |
+| `-inspect` | `false` | Also read AWS config (Block Public Access at bucket **and** account level, bucket policy status, ACLs) to explain the result. Requires AWS credentials; only works on buckets in your account. |
+| `-scan` | `false` | Scan every object in a bucket and report which are anonymously accessible. See below. |
 | `-prefix` | — | With `-scan`, only enumerate keys under this prefix. |
-| `-max-objects` | `1000` | With `-scan`, stop after enumerating this many objects (`0` = no limit). |
-| `-concurrency` | `16` | With `-scan`, number of concurrent anonymous probes. |
+| `-max-objects` | `1000` | With `-scan`, stop after enumerating this many objects (`0` = no limit). **This is a coverage limit, not just a performance knob** — see completeness below. |
+| `-concurrency` | `16` | With `-scan`, number of concurrent anonymous probes (1–256). |
 | `-keys-from` | — | With `-scan`, read candidate keys from a file instead of the S3 API (no AWS credentials required). |
-| `-json` | `false` | Emit the result as JSON. |
+| `-allow-partial` | `false` | With `-scan`, exit `0` for a truncated/incomplete scan that found no public object (default: incomplete scans exit `2`). |
+| `-json` | `false` | Emit the result as JSON (includes `schemaVersion` and `toolVersion`). |
 | `-region` | auto | Override the region instead of auto-detecting it. |
-| `-timeout` | `15s` | Overall network timeout. |
-| `-fail-if-public` | `true` | Exit `1` when the target (or, in scan mode, any object) is public. Set `-fail-if-public=false` to always exit `0` on success. |
+| `-request-timeout` | `15s` | Timeout for each individual HTTP/AWS request. |
+| `-timeout` | `60s` | Overall timeout for the whole operation. **Raise this for large scans.** |
+| `-fail-if-public` | `true` | Exit `1` when the target (or, in scan mode, any object) is public. |
+| `-version` | | Print version and exit. |
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | not public (definitively) |
+| `1` | public (anonymously accessible) |
+| `2` | inconclusive, usage, or runtime error |
 
 ## Scanning a bucket for public objects
 
 A bucket that is **not** publicly *listable* can still contain individually
-public *objects* — the two are separate permissions. `-scan` finds them by
-enumerating the bucket's keys and probing each one anonymously.
+public *objects*. `-scan` finds them by enumerating the bucket's keys and probing
+each one anonymously. Enumeration is streamed into a bounded worker pool, so
+memory stays flat regardless of bucket size.
 
 Because you cannot enumerate a non-listable bucket anonymously, key discovery
 uses one of two sources:
@@ -75,67 +113,99 @@ uses one of two sources:
   ```
 
 - **Key list (`--keys-from`)** — probes a newline-delimited file of candidate
-  keys, no credentials required. Blank lines and lines starting with `#` are
-  ignored.
+  keys, no credentials required. Keys are used **verbatim** (only a trailing
+  CR is stripped); leading slashes, spaces, and `#` are all valid key bytes and
+  are preserved. Blank lines are skipped.
 
   ```sh
   s3-access-check --scan --keys-from keys.txt s3://my-bucket
   ```
 
-Each discovered key is fetched anonymously (ranged `GetObject`); only objects
-that return success are reported as public. In scan mode the tool exits `1` if
-**any** object is anonymously accessible.
+### Scan completeness
 
-> By default only the first `--max-objects` (1000) keys are scanned; the output
-> notes when enumeration was truncated. Raise it or set `0` for no limit.
+A scan reports its coverage explicitly and **fails closed**:
 
-### Exit codes
-
-| Code | Meaning |
-| --- | --- |
-| `0` | Not public |
-| `1` | Public (anonymously accessible) |
-| `2` | Usage or runtime error |
-
-This makes the tool easy to gate on in CI or scripts.
-
-## Examples
-
-```sh
-# Is this bucket publicly listable?
-s3-access-check s3://my-bucket
-
-# Is this specific object publicly readable?
-s3-access-check https://my-bucket.s3.amazonaws.com/reports/2026.pdf
-
-# Machine-readable output
-s3-access-check --json s3://my-bucket
-
-# Explain why (needs AWS credentials)
-s3-access-check --inspect s3://my-bucket
 ```
+Coverage:  enumerated 1000, completed 997 (public 0, not-public 995, inconclusive 2)
+Status:    INCOMPLETE (hit --max-objects limit; 2 probe(s) inconclusive) — a clean result here does NOT certify the bucket
+```
+
+A scan is `complete` only if it was not truncated, not cancelled, and every
+probe was conclusive. If a scan is incomplete and no public object was found,
+the tool exits `2` (not `0`) so CI never treats a partial scan as a pass. Pass
+`--allow-partial` to opt into exit `0` for incomplete scans.
+
+## Supported resources
+
+- **Supported:** general-purpose AWS S3 buckets via standard commercial
+  (`*.amazonaws.com`) REST endpoints, path-style and virtual-hosted, including
+  the legacy `s3-region` dash form and dualstack.
+- **Not currently supported / untested:** access points, Multi-Region Access
+  Points, Object Lambda, S3 Express directory buckets, transfer-acceleration and
+  FIPS endpoints, the China (`amazonaws.com.cn`) partition, S3 website endpoints,
+  and non-AWS S3-compatible services (MinIO, etc.).
+
+## Least-privilege IAM
+
+The anonymous probe needs **no** AWS permissions. The optional modes do:
+
+Scan enumeration (`--scan` via the S3 API):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::example-bucket" }
+  ]
+}
+```
+
+Config inspection (`--inspect`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketPolicyStatus",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetAccountPublicAccessBlock",
+        "s3:GetBucketAcl",
+        "s3:GetObjectAcl",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Account-level Block Public Access inspection uses S3 Control and reflects the
+caller's account; organization-enforced (SCP) policy is not separately visible
+and is noted as a warning.
 
 ## How it works
 
 1. **Region resolution** — an unauthenticated `HEAD` to the global endpoint
-   reads the `x-amz-bucket-region` response header (returned even on 3xx/403).
-2. **Bucket check** — an anonymous `GET /?list-type=2` (`ListBucket`).
-   `200` = publicly listable; `403 AccessDenied` = not; `404 NoSuchBucket` =
-   missing.
-3. **Object check** — an anonymous `GET` with `Range: bytes=0-0` (`GetObject`),
-   so a public object is confirmed by a `200`/`206` without downloading it in
-   full; `403` = private; `404` = missing.
-4. **(Optional) `--inspect`** — uses the AWS SDK to read
-   `GetPublicAccessBlock`, `GetBucketPolicyStatus`, and the bucket/object ACL,
-   reporting each best-effort (a missing permission is noted, not fatal).
-5. **(Optional) `--scan`** — enumerates the bucket's keys (via the S3 API with
-   your credentials, or from `--keys-from`) and runs the anonymous object probe
-   against each, concurrently, to surface individually public objects.
+   reads the `x-amz-bucket-region` response header.
+2. **Bucket check** — anonymous `GET /?list-type=2` (`ListBucket`).
+3. **Object check** — anonymous `HEAD` (`GetObject`).
+4. **Wrong-region handling** — a `301`/`307`/`400` that advertises the correct
+   region triggers exactly one retry against it.
+5. **Classification** — only `2xx` → public, `403`/`404` → not public; every
+   other status → inconclusive.
+6. **(Optional) `--inspect`** — reads bucket and account Block Public Access,
+   bucket policy status, and operation-aware ACL grants.
+7. **(Optional) `--scan`** — streams enumeration into concurrent anonymous
+   probes and tracks completeness.
 
-## Caveats
+## Notes and limitations
 
-- The anonymous check is the ground truth for *effective* access, but it tests
-  one operation at a time (list vs. read). Checking a bucket does not check
-  every object inside it.
 - Results reflect live state at the moment you run it, not stored config.
-- Requires outbound HTTPS to the S3 endpoints.
+- Bucket names and object keys can reveal business information — be careful when
+  writing output to shared CI logs.
+- ACL evaluation is operation-aware: an `AllUsers` grant of `READ_ACP`/`WRITE_ACP`
+  is reported but does **not** count as anonymous read; `AuthenticatedUsers`
+  grants (any AWS account, not anonymous) are reported separately.
