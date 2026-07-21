@@ -8,8 +8,8 @@ no credentials and reads the result. This reflects the resource's real,
 effective access state — the same thing an anonymous visitor on the internet
 would experience — regardless of *how* that access was configured (bucket
 policy, ACL, or Block Public Access). With `--inspect` it can additionally read
-the AWS configuration to explain *why*, and with `--scan` it can probe every
-object in a bucket.
+the AWS configuration to explain *why*, and with `--scan` it can enumerate and
+probe the objects in a bucket.
 
 > **Use responsibly.** Only run this against buckets and objects you own or are
 > explicitly authorized to test. Pointed at arbitrary buckets, an access probe
@@ -40,7 +40,7 @@ here, now, succeeded" — it is strong evidence, not a proof about every caller.
 go install github.com/ryandam9/s3-access-check@latest
 ```
 
-or build from source (Go 1.24+):
+or build from source (Go 1.25+):
 
 ```sh
 go build -o s3-access-check .
@@ -86,11 +86,12 @@ private bucket can hold public objects and vice versa.
 | `-list-prefix` | — | For a single bucket check, test anonymous `ListBucket` scoped to this prefix (some policies grant listing only under a prefix). |
 | `-scan` | `false` | Scan every object in a bucket and report which are anonymously accessible. See below. |
 | `-prefix` | — | With `-scan`, only enumerate keys under this prefix. |
-| `-max-objects` | `1000` | With `-scan`, stop after enumerating this many objects (`0` = no limit). **This is a coverage limit, not just a performance knob** — see completeness below. |
+| `-max-objects` | `1000` | With `-scan`, stop after enumerating this many **targets** — current keys, or versions with `-include-versions` (`0` = no limit). **This is a coverage limit, not just a performance knob** — see completeness below. |
+| `-max-findings` | `1000` | With `-scan`, cap the number of public/inconclusive **examples retained** in output (`0` = no cap). Counts stay exact; only the listed examples are bounded. |
 | `-concurrency` | `16` | With `-scan`, number of concurrent anonymous probes (1–256). |
 | `-keys-from` | — | With `-scan`, read candidate keys from a file instead of the S3 API (no AWS credentials required). |
-| `-include-versions` | `false` | With `-scan` (S3 API source), enumerate **all** object versions via `ListObjectVersions`, not just current versions. |
-| `-allow-partial` | `false` | With `-scan`, exit `0` for a truncated/incomplete scan that found no public object (default: incomplete scans exit `2`). |
+| `-include-versions` | `false` | With `-scan` (S3 API source), enumerate **all data-bearing** object versions via `ListObjectVersions`, not just current versions. |
+| `-allow-partial` | `false` | With `-scan`, exit `0` for a clean scan that did not fully cover the whole bucket (truncated/cancelled/inconclusive, or a prefix/key-file/current-only scope). Default: such scans exit `2`. |
 | `-json` | `false` | Emit the result as JSON (includes `schemaVersion` and `toolVersion`). |
 | `-region` | auto | Override the region instead of auto-detecting it. |
 | `-request-timeout` | `15s` | Timeout for each anonymous HTTP request (AWS SDK calls are bounded by `-timeout`). |
@@ -102,16 +103,20 @@ private bucket can hold public objects and vice versa.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | not public (definitively) |
+| `0` | not public — for a single check, a definitive `403`/`404`; for a scan, **no public object across a whole-bucket audit** |
 | `1` | public (anonymously accessible) |
-| `2` | inconclusive, usage, or runtime error |
+| `2` | inconclusive, incomplete/partial scan, usage, or runtime error |
+
+For scans, exit `0` requires a **whole-bucket** audit (see below); a clean but
+partial scan exits `2` unless `--allow-partial`.
 
 ## Scanning a bucket for public objects
 
 A bucket that is **not** publicly *listable* can still contain individually
 public *objects*. `-scan` finds them by enumerating the bucket's keys and probing
-each one anonymously. Enumeration is streamed into a bounded worker pool, so
-memory stays flat regardless of bucket size.
+each one anonymously. *Enumeration* is streamed into a bounded worker pool, so
+enumeration memory stays flat regardless of bucket size; the number of retained
+public/inconclusive **findings** is bounded separately by `--max-findings`.
 
 Because you cannot enumerate a non-listable bucket anonymously, key discovery
 uses one of two sources:
@@ -133,29 +138,44 @@ uses one of two sources:
   s3-access-check --scan --keys-from keys.txt s3://my-bucket
   ```
 
-### Scan completeness
+### Scan completeness — two distinct dimensions
 
-A scan reports its coverage explicitly and **fails closed**:
+A scan separates *mechanical* completeness from *audit* coverage:
+
+- **`completeWithinScope`** — every enumerated candidate was probed
+  conclusively (not truncated, not cancelled, no inconclusive probe).
+- **`wholeBucketComplete`** — that scope *was the entire bucket*: enumerated via
+  the S3 API (not a key file), no `--prefix`, and all data-bearing versions
+  covered (either `--include-versions`, or versioning is known to be off so
+  current == whole).
+
+The tool **fails closed**: exit `0` requires `wholeBucketComplete`. A scan that
+is clean but only partial — a prefix, a `--keys-from` candidate list, or
+current-versions-only on a versioned/unknown bucket — exits `2` unless you pass
+`--allow-partial`. This prevents "I checked some things and found nothing" from
+being mistaken for "the bucket has no anonymous exposure".
 
 ```
-Coverage:  enumerated 1000, completed 997 (public 0, not-public 995, inconclusive 2)
-Status:    INCOMPLETE (hit --max-objects limit; 2 probe(s) inconclusive) — a clean result here does NOT certify the bucket
+Scope:     current_versions (unit: keys)
+Versioning: Enabled
+Status:    complete WITHIN SCOPE, but this is NOT a whole-bucket audit
+           (a clean result here does NOT certify the entire bucket)
 ```
-
-A scan is `complete` only if it was not truncated, not cancelled, and every
-probe was conclusive. If a scan is incomplete and no public object was found,
-the tool exits `2` (not `0`) so CI never treats a partial scan as a pass. Pass
-`--allow-partial` to opt into exit `0` for incomplete scans.
 
 ### Version scope
 
 By default a scan covers **current** object versions only (`scope:
 current_versions`). In a versioning-enabled bucket, a noncurrent version can be
 independently public (different ACL, or hidden behind a delete marker) — so the
-default scan detects versioning and **warns** that noncurrent versions were not
-checked. Pass `--include-versions` to enumerate every version via
-`ListObjectVersions` (`scope: all_versions`); findings then carry a `versionId`.
-A `complete` current-versions scan does **not** certify the whole bucket.
+default scan detects versioning (`GetBucketVersioning`) and **warns** that
+noncurrent versions were not checked. If that versioning lookup *fails*, the
+failure is surfaced and the scan cannot claim `wholeBucketComplete` (it will not
+exit `0` without `--allow-partial`).
+
+Pass `--include-versions` to enumerate every **data-bearing** version via
+`ListObjectVersions` (`scope: all_versions`); findings then carry a `versionId`,
+and delete markers are counted (`deleteMarkersObserved`) but not probed since
+they have no object body.
 
 ## Supported resources
 

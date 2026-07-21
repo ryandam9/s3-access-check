@@ -129,7 +129,16 @@ func parseHTTPURL(raw string) (Target, error) {
 			return Target{}, fmt.Errorf("unsupported query parameter %q (only versionId is allowed)", p)
 		}
 	}
-	versionID := q.Get("versionId")
+	var versionID string
+	if vs, ok := q["versionId"]; ok {
+		if len(vs) > 1 {
+			return Target{}, fmt.Errorf("versionId specified more than once")
+		}
+		if vs[0] == "" {
+			return Target{}, fmt.Errorf("empty versionId; omit the parameter or use versionId=null for the null version")
+		}
+		versionID = vs[0]
+	}
 
 	const suffix = ".amazonaws.com"
 	if !strings.HasSuffix(host, suffix) {

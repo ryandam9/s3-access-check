@@ -59,8 +59,8 @@ func TestScanKeysFromFindsPublic(t *testing.T) {
 	if res.Completed != 3 || res.Enumerated != 3 {
 		t.Errorf("completed/enumerated = %d/%d, want 3/3", res.Completed, res.Enumerated)
 	}
-	if !res.Complete {
-		t.Errorf("expected Complete=true")
+	if !res.CompleteWithinScope {
+		t.Errorf("expected CompleteWithinScope=true")
 	}
 }
 
@@ -104,7 +104,7 @@ func TestScanTruncationExactVsOver(t *testing.T) {
 	if res.Truncated {
 		t.Errorf("exactly-at-limit scan should not be truncated")
 	}
-	if !res.Complete {
+	if !res.CompleteWithinScope {
 		t.Errorf("exactly-at-limit scan should be complete")
 	}
 
@@ -119,8 +119,8 @@ func TestScanTruncationExactVsOver(t *testing.T) {
 	if !res2.Truncated {
 		t.Errorf("over-limit scan should be truncated")
 	}
-	if res2.Complete {
-		t.Errorf("truncated scan must not be Complete")
+	if res2.CompleteWithinScope {
+		t.Errorf("truncated scan must not be complete-within-scope")
 	}
 	if res2.Enumerated != 2 {
 		t.Errorf("enumerated = %d, want 2", res2.Enumerated)
@@ -139,7 +139,7 @@ func TestScanInconclusiveNotComplete(t *testing.T) {
 	if res.InconclusiveCount != 1 || len(res.Failures) != 1 {
 		t.Errorf("inconclusive = %d failures = %d, want 1/1", res.InconclusiveCount, len(res.Failures))
 	}
-	if res.Complete {
-		t.Errorf("a scan with an inconclusive probe must not be Complete")
+	if res.CompleteWithinScope {
+		t.Errorf("a scan with an inconclusive probe must not be complete-within-scope")
 	}
 }

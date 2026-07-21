@@ -41,10 +41,13 @@ func TestParseTarget(t *testing.T) {
 		// errors
 		{in: "", wantErr: true},
 		{in: "s3://", wantErr: true},
-		{in: "ab", wantErr: true},                                                     // too short
-		{in: "https://minio.example/my-bucket/key", wantErr: true},                    // unknown host
-		{in: "https://my-bucket.s3.amazonaws.com/k?X-Amz-Signature=x", wantErr: true}, // signed URL
-		{in: "https://my-bucket.s3.amazonaws.com/k?partNumber=1", wantErr: true},      // unsupported query param
+		{in: "ab", wantErr: true},                                                           // too short
+		{in: "https://minio.example/my-bucket/key", wantErr: true},                          // unknown host
+		{in: "https://my-bucket.s3.amazonaws.com/k?X-Amz-Signature=x", wantErr: true},       // signed URL
+		{in: "https://my-bucket.s3.amazonaws.com/k?partNumber=1", wantErr: true},            // unsupported query param
+		{in: "https://my-bucket.s3.amazonaws.com/k?versionId=", wantErr: true},              // empty versionId
+		{in: "https://my-bucket.s3.amazonaws.com/k?versionId=a&versionId=b", wantErr: true}, // duplicate versionId
+		{in: "https://my-bucket.s3.amazonaws.com/k?versionId=null", bucket: "my-bucket", key: "k", versionID: "null"},
 	}
 
 	for _, tc := range tests {

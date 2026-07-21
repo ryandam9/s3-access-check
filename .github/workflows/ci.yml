@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Use bash on every runner (including Windows) so command-line quoting — e.g.
+# `-coverprofile=coverage.out ./...` — parses identically across the matrix.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -43,8 +49,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          # Use the latest patched toolchain so govulncheck evaluates the fixed
-          # standard library rather than whatever minimum go.mod declares.
+          # Evaluate against the latest patched toolchain so govulncheck sees a
+          # fixed standard library rather than go.mod's declared minimum.
           go-version: stable
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # Intentionally @latest: for a security scanner, an up-to-date analyzer and
+      # vulnerability database matter more than build reproducibility of the tool
+      # itself. Dependabot keeps the pinned actions current.
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
