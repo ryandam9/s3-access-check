@@ -79,7 +79,7 @@ With Go 1.25+:
 go install github.com/ryandam9/s3-access-check@latest
 ```
 
-Or build from source:
+### Build from source
 
 ```sh
 git clone https://github.com/ryandam9/s3-access-check
@@ -87,11 +87,27 @@ cd s3-access-check
 go build -o s3-access-check .
 ```
 
+Or use the **Makefile**, which stamps version/commit/date into the binary via
+`-ldflags` (so `-version` reports real build metadata):
+
+```sh
+make build                 # -> bin/s3-access-check
+make install               # build + copy to ~/.local/bin (on PATH) or /usr/local/bin
+make install PREFIX=~/bin  # ...or an explicit destination
+```
+
+`make help` lists every target (`fmt`, `vet`, `test`, `build`, `install`,
+`clean`, `run`, `tidy`, `lint`). See [Development](#development) for the rest.
+
 Check the version:
 
 ```sh
-s3-access-check -version
+$ s3-access-check -version
+s3-access-check v1.2.0 (commit 3f33af5, built 2026-07-22T07:38:52Z)
 ```
+
+(A plain `go build` without the ldflags reports `dev` / `none` / `unknown` —
+use `make build` or `go install` at a tag for real metadata.)
 
 ---
 
@@ -669,9 +685,25 @@ Not currently — only AWS S3 endpoints are supported.
 
 ## Development
 
+A [`Makefile`](Makefile) wraps the common tasks:
+
 ```sh
-go build ./...              # build
-go test -race ./...         # unit tests (network-free; uses stubbed clients)
+make build     # build bin/s3-access-check with version/commit/date stamped in
+make test      # go test -race -count=1 ./...  (network-free; stubbed clients)
+make vet       # go vet ./...
+make fmt       # go fmt ./...
+make lint      # golangci-lint (skipped if not installed)
+make tidy      # go mod tidy
+make run ARGS="s3://noaa-goes16"   # build + run against a target
+make clean     # remove the binary and bin/
+make all       # fmt + vet + test + build + install
+```
+
+Equivalent raw commands if you prefer:
+
+```sh
+go build ./...
+go test -race ./...
 go vet ./...
 gofmt -l .                  # should print nothing
 ```
