@@ -1,3 +1,4 @@
 s3-access-check
 *.exe
 /scratchpad/
+/bin/
