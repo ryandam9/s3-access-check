@@ -23,8 +23,12 @@ import (
 	"unicode"
 )
 
-// version is overridable at build time via -ldflags "-X main.version=...".
-var version = "dev"
+// Build metadata, overridable at link time via -ldflags "-X main.version=... etc".
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
 
 // schemaVersion identifies the JSON output contract so automation can detect
 // breaking changes. v3 split scan completeness into completeWithinScope vs
@@ -105,7 +109,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 	if *showVersion {
-		fmt.Fprintf(stdout, "s3-access-check %s\n", version)
+		fmt.Fprintf(stdout, "s3-access-check %s (commit %s, built %s)\n", version, commit, date)
 		return exitNotPublic
 	}
 
